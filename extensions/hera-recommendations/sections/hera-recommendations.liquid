@@ -1,0 +1,230 @@
+{% comment %}
+  Hera Recommendation Section
+  - Renders a skeleton loader immediately
+  - Fetches recommendations from Hera API asynchronously
+  - Uses product handles to call Shopify native /products/{handle}.js
+  - Renders using theme's existing product card snippet
+{% endcomment %}
+
+<div
+  id="hera-recommendations-{{ section.id }}"
+  class="hera-recommendations"
+  data-section-id="{{ section.id }}"
+  data-product-sku="{{ product.selected_or_first_available_variant.sku }}"
+  data-customer-id="{{ customer.id }}"
+  data-api-url="{{ section.settings.api_url }}"
+  data-title="{{ section.settings.title }}"
+  data-count="{{ section.settings.recommendation_count }}"
+>
+
+  {% comment %} Skeleton loader {% endcomment %}
+  <div class="hera-skeleton" aria-hidden="true">
+    <h2 class="hera-section-title">{{ section.settings.title }}</h2>
+    <div class="hera-grid">
+      {% for i in (1..section.settings.recommendation_count) %}
+        <div class="hera-skeleton-card">
+          <div class="hera-skeleton-image"></div>
+          <div class="hera-skeleton-text hera-skeleton-text--title"></div>
+          <div class="hera-skeleton-text hera-skeleton-text--price"></div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  {% comment %} Real content — populated by JS {% endcomment %}
+  <div class="hera-content" style="display:none;">
+    <h2 class="hera-section-title">{{ section.settings.title }}</h2>
+    <div class="hera-grid hera-products-grid"></div>
+  </div>
+
+</div>
+
+<style>
+  .hera-recommendations {
+    padding: 40px 0;
+  }
+
+  .hera-section-title {
+    font-size: 1.5rem;
+    margin-bottom: 20px;
+    text-align: center;
+  }
+
+  .hera-grid {
+    display: grid;
+    grid-template-columns: repeat({{ section.settings.recommendation_count }}, 1fr);
+    gap: 20px;
+  }
+
+  @media (max-width: 768px) {
+    .hera-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  @media (max-width: 480px) {
+    .hera-grid { grid-template-columns: 1fr 1fr; }
+  }
+
+  .hera-skeleton-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .hera-skeleton-image {
+    width: 100%;
+    aspect-ratio: 1;
+    background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+    background-size: 200% 100%;
+    animation: hera-shimmer 1.5s infinite;
+    border-radius: 4px;
+  }
+
+  .hera-skeleton-text {
+    height: 16px;
+    background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+    background-size: 200% 100%;
+    animation: hera-shimmer 1.5s infinite;
+    border-radius: 4px;
+  }
+
+  .hera-skeleton-text--title { width: 80%; }
+  .hera-skeleton-text--price { width: 40%; }
+
+  @keyframes hera-shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+</style>
+
+<script>
+(function() {
+  const container = document.getElementById('hera-recommendations-{{ section.id }}');
+  if (!container) return;
+
+  const productSku = container.dataset.productSku;
+  const customerId = container.dataset.customerId;
+  const apiUrl = container.dataset.apiUrl;
+  const count = parseInt(container.dataset.count) || 4;
+  const shop = window.Shopify?.shop || '';
+
+  const skeleton = container.querySelector('.hera-skeleton');
+  const content = container.querySelector('.hera-content');
+  const grid = container.querySelector('.hera-products-grid');
+
+  if (!apiUrl || !productSku) {
+    skeleton.style.display = 'none';
+    return;
+  }
+
+  // Fetch recommendations from Hera API
+  async function fetchRecommendations() {
+    const params = new URLSearchParams({
+      shop,
+      product: productSku,
+      ...(customerId && { customer: customerId }),
+    });
+
+    const res = await fetch(`${apiUrl}/api/recommend?${params}`);
+    if (!res.ok) throw new Error('Hera API error');
+    const data = await res.json();
+    return data.recommendations || [];
+  }
+
+  // Fetch product details using Shopify native endpoint (no token needed)
+  async function fetchProductDetails(handle) {
+    const res = await fetch(`/products/${handle}.js`);
+    if (!res.ok) return null;
+    return await res.json();
+  }
+
+  // Format price from Shopify (price is in cents)
+  function formatPrice(price) {
+    return (price / 100).toLocaleString('en-CA', {
+      style: 'currency',
+      currency: 'CAD',
+    });
+  }
+
+  // Render a single product card
+  function renderCard(product) {
+    const image = product.featured_image;
+    const price = product.price;
+    return `
+      <a href="/products/${product.handle}" class="hera-product-card">
+        ${image
+          ? `<img src="${image}" alt="${product.title}" loading="lazy" />`
+          : `<div class="hera-skeleton-image"></div>`
+        }
+        <p class="hera-product-title">${product.title}</p>
+        <p class="hera-product-price">${formatPrice(price)}</p>
+      </a>
+    `;
+  }
+
+  // Main
+  async function init() {
+    try {
+      const recs = await fetchRecommendations();
+
+      if (recs.length === 0) {
+        skeleton.style.display = 'none';
+        return;
+      }
+
+      // Fetch all product details in parallel
+      const handles = recs.slice(0, count).map(r => r.handle);
+      const products = await Promise.all(handles.map(fetchProductDetails));
+      const validProducts = products.filter(Boolean);
+
+      if (validProducts.length === 0) {
+        skeleton.style.display = 'none';
+        return;
+      }
+
+      grid.innerHTML = validProducts.map(renderCard).join('');
+      skeleton.style.display = 'none';
+      content.style.display = 'block';
+
+    } catch (err) {
+      console.error('Hera Recommendations error:', err);
+      skeleton.style.display = 'none';
+    }
+  }
+
+  init();
+})();
+</script>
+
+{% schema %}
+{
+  "name": "Hera Recommendations",
+  "settings": [
+    {
+      "type": "text",
+      "id": "title",
+      "label": "Section title",
+      "default": "You may also like"
+    },
+    {
+      "type": "text",
+      "id": "api_url",
+      "label": "Hera API URL",
+      "info": "Your Hera Recommendation app URL on Render, e.g. https://hera-recommendation.onrender.com"
+    },
+    {
+      "type": "range",
+      "id": "recommendation_count",
+      "label": "Number of recommendations",
+      "min": 2,
+      "max": 8,
+      "step": 1,
+      "default": 4
+    }
+  ],
+  "presets": [
+    {
+      "name": "Hera Recommendations"
+    }
+  ]
+}
+{% endschema %}

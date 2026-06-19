@@ -1,0 +1,87 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+model Recommendation {
+  productId         String   @id @map("product_id")
+  recommendedIds    Json     @default("[]") @map("recommended_ids")
+  confidence        Float[]  @map("confidence")
+  coOccurrenceCount Int[]    @map("co_occurrence_count")
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("recommendations")
+}
+
+model Order {
+  orderId    String   @id @map("order_id")
+  customerId String?  @map("customer_id")
+  productIds Json     @default("[]") @map("product_ids")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@map("orders")
+}
+
+model TrainingLog {
+  id          Int      @id @default(autoincrement())
+  triggeredBy String   @map("triggered_by")
+  ordersCount Int      @default(0) @map("orders_count")
+  status      String
+  durationMs  Int?     @map("duration_ms")
+  errorMsg    String?  @map("error_msg")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@map("training_logs")
+}
+
+model RecommendationEvent {
+  id                 Int      @id @default(autoincrement())
+  sourceProduct      String   @map("source_product")
+  recommendedProduct String   @map("recommended_product")
+  eventType          String   @map("event_type")
+  sessionId          String?  @map("session_id")
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  @@map("recommendation_events")
+}
+
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("settings")
+}
+
+model SkuToHandle {
+  sku       String   @id
+  handle    String
+  title     String?
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("sku_to_handle")
+}
