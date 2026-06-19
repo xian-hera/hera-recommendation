@@ -1,6 +1,6 @@
 /**
  * Incremental training logic
- * Fetches new orders from Shopify Admin API since last training,
+ * Fetches new orders from Shopify Admin API since a given date,
  * runs Apriori, and merges results into existing recommendations
  * using weighted merge (history * historyWeight + new * newDataWeight).
  */
@@ -10,18 +10,22 @@ import { buildRecommendations } from "./apriori.server.js";
 
 const prisma = new PrismaClient();
 
-// Fetch new orders from Shopify since a given date
+// Fetch paid + fulfilled orders from Shopify since a given date
 async function fetchNewOrders(admin, sinceDate) {
   const allOrders = [];
   let cursor = null;
   let hasNextPage = true;
 
-  console.log(`Fetching orders since: ${sinceDate.toISOString()}`);
+  console.log(`Fetching paid+fulfilled orders since: ${sinceDate.toISOString()}`);
 
   while (hasNextPage) {
     const query = `
-      query getOrders($cursor: String, $since: DateTime!) {
-        orders(first: 250, after: $cursor, query: "created_at:>=${sinceDate.toISOString()}") {
+      query getOrders($cursor: String) {
+        orders(
+          first: 250,
+          after: $cursor,
+          query: "created_at:>=${sinceDate.toISOString()} financial_status:paid fulfillment_status:shipped"
+        ) {
           pageInfo {
             hasNextPage
             endCursor
@@ -48,7 +52,7 @@ async function fetchNewOrders(admin, sinceDate) {
     `;
 
     const response = await admin.graphql(query, {
-      variables: { cursor, since: sinceDate },
+      variables: { cursor },
     });
 
     const data = await response.json();
@@ -115,7 +119,6 @@ async function mergeRecommendations(newRecs, historyWeight, newDataWeight) {
     });
 
     if (!existing) {
-      // New product, just insert
       await prisma.recommendation.create({
         data: {
           productId,
@@ -128,12 +131,10 @@ async function mergeRecommendations(newRecs, historyWeight, newDataWeight) {
       continue;
     }
 
-    // Merge existing with new
     const existingIds = existing.recommendedIds;
     const existingConfidences = existing.confidence;
     const existingCounts = existing.coOccurrenceCount;
 
-    // Build map from existing data
     const mergedMap = new Map();
     existingIds.forEach((id, i) => {
       mergedMap.set(id, {
@@ -142,7 +143,6 @@ async function mergeRecommendations(newRecs, historyWeight, newDataWeight) {
       });
     });
 
-    // Apply new data
     for (const rec of newRecList) {
       const current = mergedMap.get(rec.id);
       if (current) {
@@ -158,7 +158,6 @@ async function mergeRecommendations(newRecs, historyWeight, newDataWeight) {
       }
     }
 
-    // Sort by merged confidence, keep top 10
     const sorted = [...mergedMap.entries()]
       .sort((a, b) => b[1].confidence - a[1].confidence)
       .slice(0, 10);
@@ -178,8 +177,13 @@ async function mergeRecommendations(newRecs, historyWeight, newDataWeight) {
   return { created, updated };
 }
 
-// Main incremental training function
-export async function runIncrementalTraining(admin) {
+/**
+ * Main incremental training function
+ * @param {object} admin - Shopify admin API client
+ * @param {string|null} sinceDateOverride - ISO date string to override the auto-detected since date
+ * @param {boolean} syncOnly - If true, only sync SKU->handle mapping, skip training
+ */
+export async function runIncrementalTraining(admin, sinceDateOverride = null, syncOnly = false) {
   const startTime = Date.now();
 
   // Get settings
@@ -187,35 +191,45 @@ export async function runIncrementalTraining(admin) {
   const settings = Object.fromEntries(settingsRows.map((s) => [s.key, s.value]));
   const historyWeight = Number(settings["history_weight"] ?? 0.8);
   const newDataWeight = Number(settings["new_data_weight"] ?? 0.2);
-  const trainingDateRange = settings["training_date_range"] ?? "all";
+
+  // Sync SKU to handle mapping first
+  const { syncSkuToHandle } = await import("./sync-sku-handle.server.js");
+  await syncSkuToHandle(admin);
+
+  if (syncOnly) {
+    await prisma.trainingLog.create({
+      data: {
+        triggeredBy: "manual",
+        ordersCount: 0,
+        status: "success",
+        durationMs: Date.now() - startTime,
+        errorMsg: "Sync only — no training performed.",
+      },
+    });
+    return { success: true, ordersCount: 0, message: "SKU to handle sync complete." };
+  }
 
   // Determine since date
   let sinceDate;
-  if (trainingDateRange === "3m") {
-    sinceDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
-  } else if (trainingDateRange === "6m") {
-    sinceDate = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000);
-  } else if (trainingDateRange === "12m") {
-    sinceDate = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000);
+  if (sinceDateOverride) {
+    // Use the date provided by the user
+    sinceDate = new Date(sinceDateOverride);
+    console.log(`Using user-provided since date: ${sinceDate.toISOString()}`);
   } else {
-    // Use last incremental training date, or 30 days ago as fallback
+    // Use last successful incremental training date, or 7 days ago as fallback
     const lastIncremental = await prisma.trainingLog.findFirst({
-      where: { triggeredBy: "manual", status: "success" },
+      where: { triggeredBy: "manual", status: "success", errorMsg: null },
       orderBy: { createdAt: "desc" },
     });
     sinceDate = lastIncremental
       ? new Date(lastIncremental.createdAt)
-      : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    console.log(`Auto-detected since date: ${sinceDate.toISOString()}`);
   }
 
   let ordersCount = 0;
 
   try {
-    // Sync SKU to handle mapping
-    const { syncSkuToHandle } = await import("./sync-sku-handle.server.js");
-    await syncSkuToHandle(admin);
-
-    // Fetch new orders from Shopify
     const newOrders = await fetchNewOrders(admin, sinceDate);
     ordersCount = newOrders.length;
 
@@ -233,25 +247,21 @@ export async function runIncrementalTraining(admin) {
       return { success: true, ordersCount: 0, message: "No new orders found." };
     }
 
-    // Save orders to database
     await saveOrders(newOrders);
 
-    // Build baskets and run Apriori
     const baskets = newOrders.map((o) => o.skus);
     const newRecs = buildRecommendations(baskets, {
-      minSupport: 2, // lower threshold for incremental (smaller dataset)
+      minSupport: 2,
       minConfidence: 0.01,
       topN: 10,
     });
 
-    // Merge with existing recommendations
     const { created, updated } = await mergeRecommendations(
       newRecs,
       historyWeight,
       newDataWeight
     );
 
-    // Log success
     await prisma.trainingLog.create({
       data: {
         triggeredBy: "manual",
