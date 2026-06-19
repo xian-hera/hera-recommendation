@@ -8,7 +8,26 @@ import { PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+// Handle CORS preflight
+export const action = async ({ request }) => {
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+  return new Response(null, { status: 405 });
+};
+
 export const loader = async ({ request }) => {
+  // Handle CORS preflight via GET (some browsers)
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
   const url = new URL(request.url);
   const shop = url.searchParams.get("shop");
   const productSku = url.searchParams.get("product");
@@ -17,7 +36,7 @@ export const loader = async ({ request }) => {
   if (!shop || !productSku) {
     return Response.json(
       { error: "Missing required params: shop, product" },
-      { status: 400 }
+      { status: 400, headers: corsHeaders }
     );
   }
 
@@ -106,13 +125,19 @@ export const loader = async ({ request }) => {
         score: Math.round((merged.get(sku) || 0) * 1000) / 1000,
       }));
 
-    return Response.json({
-      product: productSku,
-      customer: customerId || null,
-      recommendations: results,
-    });
+    return Response.json(
+      {
+        product: productSku,
+        customer: customerId || null,
+        recommendations: results,
+      },
+      { headers: corsHeaders }
+    );
   } catch (err) {
     console.error("Recommendation API error:", err);
-    return Response.json({ error: "Internal server error" }, { status: 500 });
+    return Response.json(
+      { error: "Internal server error" },
+      { status: 500, headers: corsHeaders }
+    );
   }
 };
