@@ -81,6 +81,7 @@ model SkuToHandle {
   sku       String   @id
   handle    String
   title     String?
+  productId String?  @map("product_id")
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@map("sku_to_handle")

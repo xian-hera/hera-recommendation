@@ -79,6 +79,15 @@ export const action = async ({ request }) => {
     return result;
   }
 
+  if (intent === "sync_metafields") {
+    const { syncMetafields } = await import("../lib/sync-metafields.server.js");
+    const result = await syncMetafields(admin);
+    return {
+      success: true,
+      message: `Metafield sync complete. ${result.synced} synced, ${result.failed} failed, ${result.duration}s.`,
+    };
+  }
+
   return { success: false, message: "Unknown intent." };
 };
 
@@ -203,6 +212,30 @@ export default function Training() {
                   Sync SKU to Handle
                 </Button>
               </fetcher.Form>
+
+              <Divider />
+
+              <BlockStack gap="100">
+                <Text variant="headingMd">Sync Metafields</Text>
+                <Text tone="subdued">
+                  Write recommendation results to Shopify product metafields.
+                  Run this after your first local training to populate metafields,
+                  or after any training to push updates to the storefront.
+                  This may take up to 48 minutes for a full sync.
+                </Text>
+              </BlockStack>
+
+              <fetcher.Form method="post">
+                <input type="hidden" name="intent" value="sync_metafields" />
+                <Button
+                  submit
+                  loading={isTriggering}
+                  disabled={isTriggering}
+                >
+                  Sync Metafields
+                </Button>
+              </fetcher.Form>
+
             </BlockStack>
           </Card>
         </Layout.Section>

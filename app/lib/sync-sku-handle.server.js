@@ -1,6 +1,7 @@
 /**
  * Sync SKU to product handle mapping from Shopify Admin API
  * Called during incremental training to keep mapping up to date
+ * Also stores product ID for faster metafield writes
  */
 
 import { PrismaClient } from "@prisma/client";
@@ -24,6 +25,7 @@ export async function syncSkuToHandle(admin) {
           }
           edges {
             node {
+              id
               handle
               title
               variants(first: 100) {
@@ -48,15 +50,15 @@ export async function syncSkuToHandle(admin) {
     if (!products) break;
 
     for (const edge of products.edges) {
-      const { handle, title, variants } = edge.node;
+      const { id, handle, title, variants } = edge.node;
       for (const variantEdge of variants.edges) {
         const sku = variantEdge.node.sku?.trim();
         if (!sku) continue;
 
         await prisma.skuToHandle.upsert({
           where: { sku },
-          update: { handle, title },
-          create: { sku, handle, title },
+          update: { handle, title, productId: id },
+          create: { sku, handle, title, productId: id },
         });
         synced++;
       }

@@ -197,6 +197,10 @@ export async function runIncrementalTraining(admin, sinceDateOverride = null, sy
   await syncSkuToHandle(admin);
 
   if (syncOnly) {
+    // Sync metafields after SKU sync
+    const { syncMetafields } = await import("./sync-metafields.server.js");
+    await syncMetafields(admin);
+
     await prisma.trainingLog.create({
       data: {
         triggeredBy: "manual",
@@ -206,17 +210,15 @@ export async function runIncrementalTraining(admin, sinceDateOverride = null, sy
         errorMsg: "Sync only — no training performed.",
       },
     });
-    return { success: true, ordersCount: 0, message: "SKU to handle sync complete." };
+    return { success: true, ordersCount: 0, message: "SKU to handle sync and metafield sync complete." };
   }
 
   // Determine since date
   let sinceDate;
   if (sinceDateOverride) {
-    // Use the date provided by the user
     sinceDate = new Date(sinceDateOverride);
     console.log(`Using user-provided since date: ${sinceDate.toISOString()}`);
   } else {
-    // Use last successful incremental training date, or 7 days ago as fallback
     const lastIncremental = await prisma.trainingLog.findFirst({
       where: { triggeredBy: "manual", status: "success", errorMsg: null },
       orderBy: { createdAt: "desc" },
@@ -261,6 +263,10 @@ export async function runIncrementalTraining(admin, sinceDateOverride = null, sy
       historyWeight,
       newDataWeight
     );
+
+    // Sync metafields after training
+    const { syncMetafields } = await import("./sync-metafields.server.js");
+    await syncMetafields(admin);
 
     await prisma.trainingLog.create({
       data: {
