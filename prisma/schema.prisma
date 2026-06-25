@@ -58,6 +58,18 @@ model TrainingLog {
   @@map("training_logs")
 }
 
+model SyncLog {
+  id            Int      @id @default(autoincrement())
+  triggeredBy   String   @map("triggered_by")  // manual | cron
+  productsCount Int      @default(0) @map("products_count")
+  status        String                          // success | failed
+  durationMs    Int?     @map("duration_ms")
+  errorMsg      String?  @map("error_msg")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@map("sync_logs")
+}
+
 model RecommendationEvent {
   id                 Int      @id @default(autoincrement())
   sourceProduct      String   @map("source_product")
@@ -85,4 +97,18 @@ model SkuToHandle {
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@map("sku_to_handle")
+}
+
+model MetafieldSyncQueue {
+  id          Int      @id @default(autoincrement())
+  productId   String   @map("product_id")
+  handles     Json     @default("[]")
+  status      String   @default("pending")
+  attempts    Int      @default(0)
+  errorMsg    String?  @map("error_msg")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@map("metafield_sync_queue")
 }

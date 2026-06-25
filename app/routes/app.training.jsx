@@ -41,6 +41,20 @@ export const loader = async ({ request }) => {
 
   const mappingCount = await prisma.recommendation.count();
 
+  // Queue stats
+  const queuePending = await prisma.metafieldSyncQueue.count({
+    where: { status: "pending" },
+  });
+  const queueFailed = await prisma.metafieldSyncQueue.count({
+    where: { status: "failed" },
+  });
+
+  // Last sync log
+  const lastSyncLog = await prisma.syncLog.findFirst({
+    where: { status: "success" },
+    orderBy: { createdAt: "desc" },
+  });
+
   // eslint-disable-next-line no-undef
   const appUrl = process.env.SHOPIFY_APP_URL || "";
 
@@ -55,7 +69,12 @@ export const loader = async ({ request }) => {
     lastAutomaticTraining: lastAutomaticTraining
       ? { createdAt: lastAutomaticTraining.createdAt.toISOString() }
       : null,
+    lastSyncLog: lastSyncLog
+      ? { ...lastSyncLog, createdAt: lastSyncLog.createdAt.toISOString() }
+      : null,
     mappingCount,
+    queuePending,
+    queueFailed,
     appUrl,
   };
 };
@@ -79,12 +98,22 @@ export const action = async ({ request }) => {
     return result;
   }
 
-  if (intent === "sync_metafields") {
-    const { syncMetafields } = await import("../lib/sync-metafields.server.js");
-    const result = await syncMetafields(admin);
+  if (intent === "trigger_metafield_sync") {
+    // eslint-disable-next-line no-undef
+    const appUrl = process.env.SHOPIFY_APP_URL || "";
+    // eslint-disable-next-line no-undef
+    const cronSecret = process.env.CRON_SECRET || "";
+    const res = await fetch(`${appUrl}/api/cron/sync-metafields`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${cronSecret}`,
+        "X-Triggered-By": "manual",
+      },
+    });
+    const data = await res.json();
     return {
-      success: true,
-      message: `Metafield sync complete. ${result.synced} synced, ${result.failed} failed, ${result.duration}s.`,
+      success: res.ok,
+      message: data.message || data.error || "Unknown error",
     };
   }
 
@@ -92,16 +121,26 @@ export const action = async ({ request }) => {
 };
 
 export default function Training() {
-  const { recentLogs, latestTraining, mappingCount, lastAutomaticTraining, appUrl } =
-    useLoaderData();
+  const {
+    recentLogs,
+    latestTraining,
+    mappingCount,
+    lastAutomaticTraining,
+    lastSyncLog,
+    queuePending,
+    queueFailed,
+    appUrl,
+  } = useLoaderData();
   const fetcher = useFetcher();
   const [sinceDate, setSinceDate] = useState("");
 
   const isTriggering = fetcher.state !== "idle";
   const result = fetcher.data;
 
-  const cronUrl = `${appUrl}/api/cron/train`;
-  const cronCommand = `curl -X POST ${cronUrl} -H "Authorization: Bearer $CRON_SECRET"`;
+  const trainingCronUrl = `${appUrl}/api/cron/train`;
+  const trainingCronCommand = `curl -X POST ${trainingCronUrl} -H "Authorization: Bearer $CRON_SECRET"`;
+  const syncCronUrl = `${appUrl}/api/cron/sync-metafields`;
+  const syncCronCommand = `curl -X POST ${syncCronUrl} -H "Authorization: Bearer $CRON_SECRET"`;
 
   const rows = recentLogs.map((log) => [
     new Date(log.createdAt).toLocaleString(),
@@ -161,6 +200,7 @@ export default function Training() {
                 <Text tone="subdued">
                   Fetch paid and fulfilled orders from Shopify and update the
                   recommendation model using weighted merge (history 80% / new 20%).
+                  After training, changed products are queued for metafield sync.
                 </Text>
               </BlockStack>
 
@@ -197,50 +237,68 @@ export default function Training() {
               <BlockStack gap="100">
                 <Text variant="headingMd">Sync SKU → Handle Only</Text>
                 <Text tone="subdued">
-                  Sync product handle mapping without running training. Use this
-                  after your first local training to populate the mapping table.
+                  Sync product handle mapping without running training.
                 </Text>
               </BlockStack>
 
               <fetcher.Form method="post">
                 <input type="hidden" name="intent" value="sync_only" />
-                <Button
-                  submit
-                  loading={isTriggering}
-                  disabled={isTriggering}
-                >
+                <Button submit loading={isTriggering} disabled={isTriggering}>
                   Sync SKU to Handle
                 </Button>
               </fetcher.Form>
-
-              <Divider />
-
-              <BlockStack gap="100">
-                <Text variant="headingMd">Sync Metafields</Text>
-                <Text tone="subdued">
-                  Write recommendation results to Shopify product metafields.
-                  Run this after your first local training to populate metafields,
-                  or after any training to push updates to the storefront.
-                  This may take up to 48 minutes for a full sync.
-                </Text>
-              </BlockStack>
-
-              <fetcher.Form method="post">
-                <input type="hidden" name="intent" value="sync_metafields" />
-                <Button
-                  submit
-                  loading={isTriggering}
-                  disabled={isTriggering}
-                >
-                  Sync Metafields
-                </Button>
-              </fetcher.Form>
-
             </BlockStack>
           </Card>
         </Layout.Section>
 
-        {/* Automatic training (Cron Job) */}
+        {/* Metafield sync queue */}
+        <Layout.Section>
+          <Card>
+            <BlockStack gap="400">
+              <BlockStack gap="100">
+                <Text variant="headingMd">Metafield Sync Queue</Text>
+                <Text tone="subdued">
+                  Processes up to 100 products per run. Trigger manually or let
+                  the cron job handle it automatically every 5 minutes.
+                </Text>
+              </BlockStack>
+
+              <InlineStack gap="600">
+                <BlockStack gap="100">
+                  <Text tone="subdued">Pending</Text>
+                  <Text variant="bodyLg">{queuePending.toLocaleString()}</Text>
+                </BlockStack>
+                <BlockStack gap="100">
+                  <Text tone="subdued">Failed</Text>
+                  <Text variant="bodyLg">
+                    {queueFailed > 0 ? (
+                      <Badge tone="critical">{queueFailed.toLocaleString()}</Badge>
+                    ) : (
+                      "0"
+                    )}
+                  </Text>
+                </BlockStack>
+                <BlockStack gap="100">
+                  <Text tone="subdued">Last sync</Text>
+                  <Text variant="bodyLg">
+                    {lastSyncLog
+                      ? new Date(lastSyncLog.createdAt).toLocaleString()
+                      : "Never"}
+                  </Text>
+                </BlockStack>
+              </InlineStack>
+
+              <fetcher.Form method="post">
+                <input type="hidden" name="intent" value="trigger_metafield_sync" />
+                <Button submit loading={isTriggering} disabled={isTriggering}>
+                  Run Metafield Sync Now
+                </Button>
+              </fetcher.Form>
+            </BlockStack>
+          </Card>
+        </Layout.Section>
+
+        {/* Automatic training cron */}
         <Layout.Section>
           <Card>
             <BlockStack gap="400">
@@ -267,29 +325,27 @@ export default function Training() {
               <Divider />
 
               <BlockStack gap="200">
-                <Text variant="headingMd">Setup Instructions</Text>
+                <Text variant="headingMd">Training Cron Setup</Text>
                 <Text tone="subdued">
-                  1. Go to Render Dashboard → New → Cron Job
+                  Schedule: <code>0 2 * * 1</code> (every Monday at 2am)
                 </Text>
-                <Text tone="subdued">
-                  2. Connect the same GitHub repo
-                </Text>
-                <Text tone="subdued">
-                  3. Set schedule: <code>0 2 * * 1</code> (every Monday at 2am)
-                </Text>
-                <Text tone="subdued">
-                  4. Add environment variable: <code>CRON_SECRET</code> (same value as your web service)
-                </Text>
-                <Text tone="subdued">
-                  5. Set command:
-                </Text>
-                <Box
-                  background="bg-surface-secondary"
-                  padding="300"
-                  borderRadius="200"
-                >
+                <Box background="bg-surface-secondary" padding="300" borderRadius="200">
                   <Text as="p" tone="subdued">
-                    <code>{cronCommand}</code>
+                    <code>{trainingCronCommand}</code>
+                  </Text>
+                </Box>
+              </BlockStack>
+
+              <Divider />
+
+              <BlockStack gap="200">
+                <Text variant="headingMd">Metafield Sync Cron Setup</Text>
+                <Text tone="subdued">
+                  Schedule: <code>*/5 * * * *</code> (every 5 minutes)
+                </Text>
+                <Box background="bg-surface-secondary" padding="300" borderRadius="200">
+                  <Text as="p" tone="subdued">
+                    <code>{syncCronCommand}</code>
                   </Text>
                 </Box>
               </BlockStack>

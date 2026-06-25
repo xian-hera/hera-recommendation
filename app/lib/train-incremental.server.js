@@ -3,6 +3,8 @@
  * Fetches new orders from Shopify Admin API since a given date,
  * runs Apriori, and merges results into existing recommendations
  * using weighted merge (history * historyWeight + new * newDataWeight).
+ * After training, queues changed products for metafield sync instead of
+ * writing directly (to avoid HTTP timeout).
  */
 
 import { PrismaClient } from "@prisma/client";
@@ -51,10 +53,7 @@ async function fetchNewOrders(admin, sinceDate) {
       }
     `;
 
-    const response = await admin.graphql(query, {
-      variables: { cursor },
-    });
-
+    const response = await admin.graphql(query, { variables: { cursor } });
     const data = await response.json();
     const orders = data.data?.orders;
 
@@ -91,10 +90,7 @@ async function saveOrders(orders) {
   for (const order of orders) {
     await prisma.order.upsert({
       where: { orderId: order.orderId },
-      update: {
-        customerId: order.customerId,
-        productIds: order.skus,
-      },
+      update: { customerId: order.customerId, productIds: order.skus },
       create: {
         orderId: order.orderId,
         customerId: order.customerId,
@@ -108,10 +104,12 @@ async function saveOrders(orders) {
 }
 
 // Weighted merge of new recommendations into existing ones
+// Returns list of changed SKUs
 async function mergeRecommendations(newRecs, historyWeight, newDataWeight) {
   console.log(`Merging recommendations (history: ${historyWeight}, new: ${newDataWeight})...`);
   let updated = 0;
   let created = 0;
+  const changedSkus = [];
 
   for (const [productId, newRecList] of newRecs.entries()) {
     const existing = await prisma.recommendation.findUnique({
@@ -128,6 +126,7 @@ async function mergeRecommendations(newRecs, historyWeight, newDataWeight) {
         },
       });
       created++;
+      changedSkus.push(productId);
       continue;
     }
 
@@ -171,10 +170,66 @@ async function mergeRecommendations(newRecs, historyWeight, newDataWeight) {
       },
     });
     updated++;
+    changedSkus.push(productId);
   }
 
   console.log(`Merge complete: ${created} created, ${updated} updated.`);
-  return { created, updated };
+  return { created, updated, changedSkus };
+}
+
+// Queue changed products for metafield sync
+async function queueMetafieldSync(changedSkus) {
+  if (changedSkus.length === 0) return 0;
+
+  // Load SKU to handle + productId mapping
+  const skuMappings = await prisma.skuToHandle.findMany({
+    where: {
+      sku: { in: changedSkus },
+      productId: { not: null },
+    },
+  });
+  const skuToProductMap = Object.fromEntries(
+    skuMappings.map((m) => [m.sku, m.productId])
+  );
+
+  // Load recommendations for changed SKUs
+  const recommendations = await prisma.recommendation.findMany({
+    where: { productId: { in: changedSkus } },
+  });
+
+  // Load all SKU to handle mapping for converting recommended SKUs to handles
+  const allSkuMappings = await prisma.skuToHandle.findMany({
+    where: { productId: { not: null } },
+  });
+  const allSkuToHandle = Object.fromEntries(
+    allSkuMappings.map((m) => [m.sku, m.handle])
+  );
+
+  let queued = 0;
+  for (const rec of recommendations) {
+    const productId = skuToProductMap[rec.productId];
+    if (!productId) continue;
+
+    const handles = rec.recommendedIds
+      .map((sku) => allSkuToHandle[sku])
+      .filter(Boolean);
+
+    if (handles.length === 0) continue;
+
+    // Upsert to avoid duplicates if training runs multiple times
+    await prisma.metafieldSyncQueue.upsert({
+      where: { id: (await prisma.metafieldSyncQueue.findFirst({
+        where: { productId, status: "pending" },
+        select: { id: true },
+      }))?.id ?? -1 },
+      update: { handles, attempts: 0, errorMsg: null, status: "pending" },
+      create: { productId, handles, status: "pending" },
+    });
+    queued++;
+  }
+
+  console.log(`Queued ${queued} products for metafield sync.`);
+  return queued;
 }
 
 /**
@@ -197,10 +252,6 @@ export async function runIncrementalTraining(admin, sinceDateOverride = null, sy
   await syncSkuToHandle(admin);
 
   if (syncOnly) {
-    // Sync metafields after SKU sync
-    const { syncMetafields } = await import("./sync-metafields.server.js");
-    await syncMetafields(admin);
-
     await prisma.trainingLog.create({
       data: {
         triggeredBy: "manual",
@@ -210,7 +261,7 @@ export async function runIncrementalTraining(admin, sinceDateOverride = null, sy
         errorMsg: "Sync only — no training performed.",
       },
     });
-    return { success: true, ordersCount: 0, message: "SKU to handle sync and metafield sync complete." };
+    return { success: true, ordersCount: 0, message: "SKU to handle sync complete." };
   }
 
   // Determine since date
@@ -258,15 +309,14 @@ export async function runIncrementalTraining(admin, sinceDateOverride = null, sy
       topN: 10,
     });
 
-    const { created, updated } = await mergeRecommendations(
+    const { created, updated, changedSkus } = await mergeRecommendations(
       newRecs,
       historyWeight,
       newDataWeight
     );
 
-    // Sync metafields after training
-    const { syncMetafields } = await import("./sync-metafields.server.js");
-    await syncMetafields(admin);
+    // Queue changed products for metafield sync (non-blocking)
+    const queued = await queueMetafieldSync(changedSkus);
 
     await prisma.trainingLog.create({
       data: {
@@ -282,7 +332,8 @@ export async function runIncrementalTraining(admin, sinceDateOverride = null, sy
       ordersCount,
       created,
       updated,
-      message: `Incremental training complete. ${ordersCount} orders processed, ${created} new mappings, ${updated} updated.`,
+      queued,
+      message: `Training complete. ${ordersCount} orders processed, ${created} new mappings, ${updated} updated, ${queued} queued for metafield sync.`,
     };
   } catch (err) {
     console.error("Incremental training failed:", err);

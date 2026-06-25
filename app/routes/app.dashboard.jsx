@@ -12,6 +12,7 @@ import {
   DataTable,
   EmptyState,
   Banner,
+  Divider,
 } from "@shopify/polaris";
 
 const prisma = new PrismaClient();
@@ -39,7 +40,7 @@ export const loader = async ({ request }) => {
     where: { eventType: "add_to_cart" },
   });
 
-  // Check if full training is overdue
+  // Full training overdue check
   const lastFullTraining = await prisma.trainingLog.findFirst({
     where: { triggeredBy: "csv_upload", status: "success" },
     orderBy: { createdAt: "desc" },
@@ -56,6 +57,49 @@ export const loader = async ({ request }) => {
     else if (monthsSince >= 11) fullTrainingAlert = "warning";
   }
 
+  // Training activity
+  const lastManualTraining = await prisma.trainingLog.findFirst({
+    where: { triggeredBy: "manual", status: "success" },
+    orderBy: { createdAt: "desc" },
+  });
+
+  const lastAutoTraining = await prisma.trainingLog.findFirst({
+    where: { triggeredBy: "cron", status: "success" },
+    orderBy: { createdAt: "desc" },
+  });
+
+  const totalManualTrainings = await prisma.trainingLog.count({
+    where: { triggeredBy: "manual", status: "success" },
+  });
+
+  const totalAutoTrainings = await prisma.trainingLog.count({
+    where: { triggeredBy: "cron", status: "success" },
+  });
+
+  // Metafield sync activity
+  const lastManualSync = await prisma.syncLog.findFirst({
+    where: { triggeredBy: "manual", status: "success" },
+    orderBy: { createdAt: "desc" },
+  });
+
+  const lastAutoSync = await prisma.syncLog.findFirst({
+    where: { triggeredBy: "cron", status: "success" },
+    orderBy: { createdAt: "desc" },
+  });
+
+  const totalManualSyncs = await prisma.syncLog.count({
+    where: { triggeredBy: "manual", status: "success" },
+  });
+
+  const totalAutoSyncs = await prisma.syncLog.count({
+    where: { triggeredBy: "cron", status: "success" },
+  });
+
+  // Queue stats
+  const queuePending = await prisma.metafieldSyncQueue.count({
+    where: { status: "pending" },
+  });
+
   return {
     latestTraining: latestTraining
       ? { ...latestTraining, createdAt: latestTraining.createdAt.toISOString() }
@@ -71,6 +115,23 @@ export const loader = async ({ request }) => {
     lastFullTraining: lastFullTraining
       ? { createdAt: lastFullTraining.createdAt.toISOString() }
       : null,
+    lastManualTraining: lastManualTraining
+      ? { createdAt: lastManualTraining.createdAt.toISOString(), ordersCount: lastManualTraining.ordersCount }
+      : null,
+    lastAutoTraining: lastAutoTraining
+      ? { createdAt: lastAutoTraining.createdAt.toISOString(), ordersCount: lastAutoTraining.ordersCount }
+      : null,
+    totalManualTrainings,
+    totalAutoTrainings,
+    lastManualSync: lastManualSync
+      ? { createdAt: lastManualSync.createdAt.toISOString(), productsCount: lastManualSync.productsCount }
+      : null,
+    lastAutoSync: lastAutoSync
+      ? { createdAt: lastAutoSync.createdAt.toISOString(), productsCount: lastAutoSync.productsCount }
+      : null,
+    totalManualSyncs,
+    totalAutoSyncs,
+    queuePending,
   };
 };
 
@@ -83,6 +144,15 @@ export default function Dashboard() {
     recentLogs,
     fullTrainingAlert,
     lastFullTraining,
+    lastManualTraining,
+    lastAutoTraining,
+    totalManualTrainings,
+    totalAutoTrainings,
+    lastManualSync,
+    lastAutoSync,
+    totalManualSyncs,
+    totalAutoSyncs,
+    queuePending,
   } = useLoaderData();
 
   const rows = recentLogs.map((log) => [
@@ -121,6 +191,7 @@ export default function Dashboard() {
           </Layout.Section>
         )}
 
+        {/* Model status */}
         <Layout.Section>
           <Card>
             <BlockStack gap="300">
@@ -143,6 +214,7 @@ export default function Dashboard() {
           </Card>
         </Layout.Section>
 
+        {/* Recommendation performance */}
         <Layout.Section>
           <InlineGrid columns={2} gap="400">
             <Card>
@@ -160,6 +232,137 @@ export default function Dashboard() {
           </InlineGrid>
         </Layout.Section>
 
+        {/* Training activity */}
+        <Layout.Section>
+          <Card>
+            <BlockStack gap="400">
+              <Text variant="headingMd">Training Activity</Text>
+              <Divider />
+              <InlineGrid columns={2} gap="400">
+                <BlockStack gap="200">
+                  <Text variant="headingSm">Manual Incremental Training</Text>
+                  <BlockStack gap="100">
+                    <Text tone="subdued">Last run</Text>
+                    <Text>
+                      {lastManualTraining
+                        ? new Date(lastManualTraining.createdAt).toLocaleString()
+                        : "Never"}
+                    </Text>
+                  </BlockStack>
+                  <BlockStack gap="100">
+                    <Text tone="subdued">Last orders processed</Text>
+                    <Text>
+                      {lastManualTraining
+                        ? lastManualTraining.ordersCount.toLocaleString()
+                        : "-"}
+                    </Text>
+                  </BlockStack>
+                  <BlockStack gap="100">
+                    <Text tone="subdued">Total runs</Text>
+                    <Text>{totalManualTrainings.toLocaleString()}</Text>
+                  </BlockStack>
+                </BlockStack>
+
+                <BlockStack gap="200">
+                  <Text variant="headingSm">Automatic Incremental Training</Text>
+                  <BlockStack gap="100">
+                    <Text tone="subdued">Last run</Text>
+                    <Text>
+                      {lastAutoTraining
+                        ? new Date(lastAutoTraining.createdAt).toLocaleString()
+                        : "Never"}
+                    </Text>
+                  </BlockStack>
+                  <BlockStack gap="100">
+                    <Text tone="subdued">Last orders processed</Text>
+                    <Text>
+                      {lastAutoTraining
+                        ? lastAutoTraining.ordersCount.toLocaleString()
+                        : "-"}
+                    </Text>
+                  </BlockStack>
+                  <BlockStack gap="100">
+                    <Text tone="subdued">Total runs</Text>
+                    <Text>{totalAutoTrainings.toLocaleString()}</Text>
+                  </BlockStack>
+                </BlockStack>
+              </InlineGrid>
+            </BlockStack>
+          </Card>
+        </Layout.Section>
+
+        {/* Metafield sync activity */}
+        <Layout.Section>
+          <Card>
+            <BlockStack gap="400">
+              <Text variant="headingMd">Metafield Sync Activity</Text>
+              <Divider />
+              <InlineGrid columns={2} gap="400">
+                <BlockStack gap="200">
+                  <Text variant="headingSm">Manual Sync</Text>
+                  <BlockStack gap="100">
+                    <Text tone="subdued">Last run</Text>
+                    <Text>
+                      {lastManualSync
+                        ? new Date(lastManualSync.createdAt).toLocaleString()
+                        : "Never"}
+                    </Text>
+                  </BlockStack>
+                  <BlockStack gap="100">
+                    <Text tone="subdued">Last products synced</Text>
+                    <Text>
+                      {lastManualSync
+                        ? lastManualSync.productsCount.toLocaleString()
+                        : "-"}
+                    </Text>
+                  </BlockStack>
+                  <BlockStack gap="100">
+                    <Text tone="subdued">Total runs</Text>
+                    <Text>{totalManualSyncs.toLocaleString()}</Text>
+                  </BlockStack>
+                </BlockStack>
+
+                <BlockStack gap="200">
+                  <Text variant="headingSm">Automatic Sync (Cron)</Text>
+                  <BlockStack gap="100">
+                    <Text tone="subdued">Last run</Text>
+                    <Text>
+                      {lastAutoSync
+                        ? new Date(lastAutoSync.createdAt).toLocaleString()
+                        : "Never"}
+                    </Text>
+                  </BlockStack>
+                  <BlockStack gap="100">
+                    <Text tone="subdued">Last products synced</Text>
+                    <Text>
+                      {lastAutoSync
+                        ? lastAutoSync.productsCount.toLocaleString()
+                        : "-"}
+                    </Text>
+                  </BlockStack>
+                  <BlockStack gap="100">
+                    <Text tone="subdued">Total runs</Text>
+                    <Text>{totalAutoSyncs.toLocaleString()}</Text>
+                  </BlockStack>
+                </BlockStack>
+              </InlineGrid>
+
+              <Divider />
+              <BlockStack gap="100">
+                <Text tone="subdued">Pending in queue</Text>
+                <Text variant="bodyLg">
+                  {queuePending > 0 ? (
+                    <Badge tone="attention">{queuePending.toLocaleString()} pending</Badge>
+                  ) : (
+                    "Queue empty"
+                  )}
+                </Text>
+              </BlockStack>
+            </BlockStack>
+          </Card>
+        </Layout.Section>
+
+        {/* Recent training logs */}
         <Layout.Section>
           <Card>
             <BlockStack gap="300">
