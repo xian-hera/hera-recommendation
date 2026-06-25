@@ -1,10 +1,14 @@
 /**
  * Recommendation API endpoint
- * GET /api/recommend?shop=xxx&product=SKU-A&customer=123
- * Returns product handles instead of SKUs
+ * GET /api/recommend?shop=xxx&product=SKU&customer=yyy&viewed=productId1,productId2
+ *
+ * - product: current product SKU (product page)
+ * - customer: Shopify customer ID (for purchase history)
+ * - viewed: comma-separated Shopify product IDs from localStorage (homepage)
  */
 
 import { PrismaClient } from "@prisma/client";
+import { unauthenticated } from "../shopify.server.js";
 
 const prisma = new PrismaClient();
 
@@ -22,8 +26,115 @@ export const action = async ({ request }) => {
   return new Response(null, { status: 405 });
 };
 
+// Get SKUs from Shopify product IDs via Admin API
+async function getSkusFromProductIds(admin, productIds) {
+  if (!productIds || productIds.length === 0) return [];
+
+  const skus = [];
+  // Query in batches of 10
+  const batches = [];
+  for (let i = 0; i < productIds.length; i += 10) {
+    batches.push(productIds.slice(i, i + 10));
+  }
+
+  for (const batch of batches) {
+    const query = `
+      query getProducts($ids: [ID!]!) {
+        nodes(ids: $ids) {
+          ... on Product {
+            variants(first: 10) {
+              edges {
+                node {
+                  sku
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const gids = batch.map((id) => `gid://shopify/Product/${id}`);
+    const response = await admin.graphql(query, {
+      variables: { ids: gids },
+    });
+    const data = await response.json();
+
+    for (const node of data.data?.nodes || []) {
+      if (!node?.variants) continue;
+      for (const edge of node.variants.edges) {
+        const sku = edge.node.sku?.trim();
+        if (sku) skus.push(sku);
+      }
+    }
+  }
+
+  return skus;
+}
+
+// Get SKUs from customer's last order via Admin API
+async function getLastOrderSkus(admin, customerId) {
+  const query = `
+    query getCustomerOrders($customerId: ID!) {
+      customer(id: $customerId) {
+        orders(first: 1, sortKey: CREATED_AT, reverse: true) {
+          edges {
+            node {
+              lineItems(first: 50) {
+                edges {
+                  node {
+                    variant {
+                      sku
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const gid = customerId.includes("gid://")
+    ? customerId
+    : `gid://shopify/Customer/${customerId}`;
+
+  const response = await admin.graphql(query, {
+    variables: { customerId: gid },
+  });
+  const data = await response.json();
+
+  const orders = data.data?.customer?.orders?.edges || [];
+  if (orders.length === 0) return [];
+
+  const skus = orders[0].node.lineItems.edges
+    .map((e) => e.node.variant?.sku?.trim())
+    .filter(Boolean);
+
+  // Randomly pick 2 SKUs
+  const shuffled = skus.sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, 2);
+}
+
+// Score SKUs from recommendation table
+async function scoreSkus(skus, weight) {
+  const scores = new Map();
+  for (const sku of skus) {
+    const rec = await prisma.recommendation.findUnique({
+      where: { productId: sku },
+    });
+    if (rec?.recommendedIds) {
+      rec.recommendedIds.forEach((id, i) => {
+        const score = (rec.confidence[i] || 0) * weight;
+        scores.set(id, (scores.get(id) || 0) + score);
+      });
+    }
+  }
+  return scores;
+}
+
 export const loader = async ({ request }) => {
-  // Handle CORS preflight via GET (some browsers)
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
@@ -32,10 +143,19 @@ export const loader = async ({ request }) => {
   const shop = url.searchParams.get("shop");
   const productSku = url.searchParams.get("product");
   const customerId = url.searchParams.get("customer");
+  const viewedParam = url.searchParams.get("viewed");
 
-  if (!shop || !productSku) {
+  if (!shop) {
     return Response.json(
-      { error: "Missing required params: shop, product" },
+      { error: "Missing required param: shop" },
+      { status: 400, headers: corsHeaders }
+    );
+  }
+
+  // Require at least one signal
+  if (!productSku && !customerId && !viewedParam) {
+    return Response.json(
+      { error: "Missing signal: provide product, customer, or viewed" },
       { status: 400, headers: corsHeaders }
     );
   }
@@ -50,55 +170,45 @@ export const loader = async ({ request }) => {
     const browseWeight = Number(settings["browse_weight"] ?? 0.4);
     const purchaseWeight = Number(settings["purchase_weight"] ?? 0.6);
 
-    // Get recommendations for current product (browse signal)
-    const browseRec = await prisma.recommendation.findUnique({
-      where: { productId: productSku },
-    });
+    // Get Shopify Admin API client
+    const { admin } = await unauthenticated.admin(shop);
 
-    const browseScores = new Map();
-    if (browseRec?.recommendedIds) {
-      const ids = browseRec.recommendedIds;
-      const confidences = browseRec.confidence;
-      ids.forEach((id, i) => {
-        browseScores.set(id, (confidences[i] || 0) * browseWeight);
-      });
-    }
+    const merged = new Map();
 
-    // Get recommendations based on customer's last order (purchase signal)
-    const purchaseScores = new Map();
-    if (customerId) {
-      const lastOrder = await prisma.order.findFirst({
-        where: { customerId: String(customerId) },
-        orderBy: { createdAt: "desc" },
-      });
-
-      if (lastOrder?.productIds) {
-        const lastSkus = lastOrder.productIds;
-        for (const sku of lastSkus) {
-          const rec = await prisma.recommendation.findUnique({
-            where: { productId: sku },
-          });
-          if (rec?.recommendedIds) {
-            rec.recommendedIds.forEach((id, i) => {
-              const score = (rec.confidence[i] || 0) * purchaseWeight;
-              purchaseScores.set(id, (purchaseScores.get(id) || 0) + score);
-            });
-          }
-        }
+    // Signal 1: current product SKU (product page)
+    if (productSku) {
+      const scores = await scoreSkus([productSku], browseWeight);
+      for (const [id, score] of scores) {
+        merged.set(id, (merged.get(id) || 0) + score);
       }
     }
 
-    // Merge scores
-    const merged = new Map();
-    for (const [id, score] of browseScores) {
-      merged.set(id, (merged.get(id) || 0) + score);
-    }
-    for (const [id, score] of purchaseScores) {
-      merged.set(id, (merged.get(id) || 0) + score);
+    // Signal 2: recently viewed product IDs from localStorage
+    if (viewedParam) {
+      const viewedIds = viewedParam
+        .split(",")
+        .map((id) => id.trim())
+        .filter(Boolean)
+        .slice(0, 5); // take last 5 viewed
+
+      const viewedSkus = await getSkusFromProductIds(admin, viewedIds);
+      const scores = await scoreSkus(viewedSkus, browseWeight);
+      for (const [id, score] of scores) {
+        merged.set(id, (merged.get(id) || 0) + score);
+      }
     }
 
-    // Remove current product
-    merged.delete(productSku);
+    // Signal 3: customer last order (2 random SKUs)
+    if (customerId) {
+      const lastOrderSkus = await getLastOrderSkus(admin, customerId);
+      const scores = await scoreSkus(lastOrderSkus, purchaseWeight);
+      for (const [id, score] of scores) {
+        merged.set(id, (merged.get(id) || 0) + score);
+      }
+    }
+
+    // Remove current product from results
+    if (productSku) merged.delete(productSku);
 
     // Sort and take top N
     const topSkus = [...merged.entries()]
@@ -115,7 +225,6 @@ export const loader = async ({ request }) => {
       skuMappings.map((m) => [m.sku, { handle: m.handle, title: m.title }])
     );
 
-    // Build final results, preserving score order
     const results = topSkus
       .filter((sku) => skuToHandleMap[sku])
       .map((sku) => ({
@@ -127,7 +236,7 @@ export const loader = async ({ request }) => {
 
     return Response.json(
       {
-        product: productSku,
+        product: productSku || null,
         customer: customerId || null,
         recommendations: results,
       },
