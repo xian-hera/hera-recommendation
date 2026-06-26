@@ -21,7 +21,13 @@ const prisma = new PrismaClient();
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
   const rows = await prisma.setting.findMany();
-  const settings = Object.fromEntries(rows.map((r) => [r.key, r.value]));
+  // Normalize all values to strings for consistent comparison
+  const settings = Object.fromEntries(
+    rows.map((r) => [
+      r.key,
+      typeof r.value === "string" ? r.value : JSON.stringify(r.value),
+    ])
+  );
   return { settings };
 };
 
@@ -35,7 +41,6 @@ export const action = async ({ request }) => {
     ["browse_weight", formData.get("browse_weight")],
     ["purchase_weight", formData.get("purchase_weight")],
     ["training_date_range", formData.get("training_date_range")],
-    ["fallback_strategy", formData.get("fallback_strategy")],
     ["history_weight", formData.get("history_weight")],
     ["new_data_weight", formData.get("new_data_weight")],
     ["auto_training_enabled", formData.get("auto_training_enabled") === "true" ? "true" : "false"],
@@ -85,13 +90,10 @@ export default function Settings() {
   const [trainingDateRange, setTrainingDateRange] = useState(
     String(settings["training_date_range"] ?? "all")
   );
-  const [fallbackStrategy, setFallbackStrategy] = useState(
-    String(settings["fallback_strategy"] ?? "bestseller")
-  );
 
   // Auto training settings
   const [autoTrainingEnabled, setAutoTrainingEnabled] = useState(
-    settings["auto_training_enabled"] === "true" || settings["auto_training_enabled"] === true
+    settings["auto_training_enabled"] === "true"
   );
   const [autoTrainingIntervalDays, setAutoTrainingIntervalDays] = useState(
     String(settings["auto_training_interval_days"] ?? "7")
@@ -102,7 +104,7 @@ export default function Settings() {
 
   // Auto sync settings
   const [autoSyncEnabled, setAutoSyncEnabled] = useState(
-    settings["auto_sync_enabled"] === "true" || settings["auto_sync_enabled"] === true
+    settings["auto_sync_enabled"] === "true"
   );
   const [autoSyncIntervalHours, setAutoSyncIntervalHours] = useState(
     String(settings["auto_sync_interval_hours"] ?? "1")
@@ -150,16 +152,6 @@ export default function Settings() {
                     max={1}
                     step={0.01}
                     helpText="Recommendations below this confidence score are excluded. Default: 0.01"
-                  />
-                  <Select
-                    label="Fallback strategy (when not enough recommendations)"
-                    name="fallback_strategy"
-                    options={[
-                      { label: "Show bestsellers", value: "bestseller" },
-                      { label: "Show nothing", value: "none" },
-                    ]}
-                    value={fallbackStrategy}
-                    onChange={setFallbackStrategy}
                   />
                 </BlockStack>
               </Card>
@@ -265,7 +257,6 @@ export default function Settings() {
                   </Text>
                   <Checkbox
                     label="Enable automatic training"
-                    name="auto_training_enabled"
                     checked={autoTrainingEnabled}
                     onChange={setAutoTrainingEnabled}
                   />
@@ -307,11 +298,10 @@ export default function Settings() {
                 <BlockStack gap="400">
                   <Text variant="headingMd">Automatic Metafield Sync</Text>
                   <Text tone="subdued">
-                    Render Cron Job triggers every hour. APP checks these settings to decide whether to actually run.
+                    Render Cron Job triggers every 6 hours. APP checks these settings to decide whether to actually run.
                   </Text>
                   <Checkbox
                     label="Enable automatic metafield sync"
-                    name="auto_sync_enabled"
                     checked={autoSyncEnabled}
                     onChange={setAutoSyncEnabled}
                   />
@@ -324,7 +314,6 @@ export default function Settings() {
                     label="Run every X hours"
                     name="auto_sync_interval_hours"
                     options={[
-                      { label: "Every 30 minutes", value: "0.5" },
                       { label: "Every 1 hour", value: "1" },
                       { label: "Every 2 hours", value: "2" },
                       { label: "Every 6 hours", value: "6" },
