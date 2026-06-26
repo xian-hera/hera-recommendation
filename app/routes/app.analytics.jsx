@@ -7,181 +7,193 @@ import {
   Card,
   Text,
   BlockStack,
-  DataTable,
   EmptyState,
   InlineGrid,
+  InlineStack,
+  Badge,
+  Link,
 } from "@shopify/polaris";
 
 const prisma = new PrismaClient();
 
+// Get shop domain for admin links
+function getShopDomain(shop) {
+  return shop?.replace(".myshopify.com", "") || "";
+}
+
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
 
-  // Overall event counts
-  const clickCount = await prisma.recommendationEvent.count({
-    where: { eventType: "click" },
+  // Get session for shop domain
+  const session = await prisma.session.findFirst({
+    where: { isOnline: false },
+    orderBy: { expires: "desc" },
   });
-  const impressionCount = await prisma.recommendationEvent.count({
-    where: { eventType: "impression" },
-  });
-  const addToCartCount = await prisma.recommendationEvent.count({
-    where: { eventType: "add_to_cart" },
-  });
+  const shopDomain = getShopDomain(session?.shop);
 
-  const ctr = impressionCount > 0
-    ? ((clickCount / impressionCount) * 100).toFixed(2)
-    : "0.00";
-
-  // Top recommendation pairs (A → B clicked most)
-  const topPairs = await prisma.recommendationEvent.groupBy({
-    by: ["sourceProduct", "recommendedProduct"],
-    where: { eventType: "click" },
-    _count: { id: true },
-    orderBy: { _count: { id: "desc" } },
-    take: 10,
-  });
-
-  // Bundle suggestions — top co-purchased product groups
-  // Find products with highest confidence recommendations
+  // Load top recommendations by confidence
   const topRecommendations = await prisma.recommendation.findMany({
     orderBy: { updatedAt: "desc" },
-    take: 100,
+    take: 500,
   });
 
-  // Build bundle suggestions from recommendations
+  // Load SKU to handle + title + productId mapping
+  const skuMappings = await prisma.skuToHandle.findMany({
+    where: { productId: { not: null } },
+  });
+  const skuMap = Object.fromEntries(
+    skuMappings.map((m) => [m.sku, {
+      handle: m.handle,
+      title: m.title,
+      productId: m.productId,
+    }])
+  );
+
+  // Build bundle suggestions
+  // Each bundle = source product + top 1-3 recommended products
+  // Score = average confidence of the group
   const bundleSuggestions = [];
   const seen = new Set();
 
-  for (const rec of topRecommendations) {
+  // Sort all recommendations by their top confidence score
+  const sorted = topRecommendations
+    .map((rec) => {
+      const topConfidence = rec.confidence?.[0] ?? 0;
+      return { rec, topConfidence };
+    })
+    .sort((a, b) => b.topConfidence - a.topConfidence);
+
+  for (const { rec } of sorted) {
+    if (bundleSuggestions.length >= 10) break;
+
+    const sourceInfo = skuMap[rec.productId];
+    if (!sourceInfo) continue;
+
     const ids = rec.recommendedIds;
     const confidences = rec.confidence;
-
     if (!ids || ids.length === 0) continue;
 
-    // Take top 3 recommended products for this source
-    const top = ids.slice(0, 3);
-    const avgConfidence = confidences
-      .slice(0, 3)
-      .reduce((a, b) => a + b, 0) / Math.min(3, confidences.length);
+    // Take top 3 recommended products that have valid mappings
+    const topRecs = [];
+    for (let i = 0; i < Math.min(ids.length, 5); i++) {
+      const info = skuMap[ids[i]];
+      if (info) {
+        topRecs.push({
+          sku: ids[i],
+          confidence: confidences[i] || 0,
+          ...info,
+        });
+      }
+      if (topRecs.length >= 3) break;
+    }
 
-    const bundleKey = [rec.productId, ...top].sort().join("|");
+    if (topRecs.length === 0) continue;
+
+    // Build bundle key to avoid duplicates
+    const allSkus = [rec.productId, ...topRecs.map((r) => r.sku)].sort();
+    const bundleKey = allSkus.join("|");
     if (seen.has(bundleKey)) continue;
     seen.add(bundleKey);
 
+    const avgConfidence =
+      topRecs.reduce((sum, r) => sum + r.confidence, 0) / topRecs.length;
+
     bundleSuggestions.push({
-      products: [rec.productId, ...top],
-      coPurchaseRate: (avgConfidence * 100).toFixed(1),
+      source: {
+        sku: rec.productId,
+        title: sourceInfo.title || rec.productId,
+        productId: sourceInfo.productId,
+      },
+      recommendations: topRecs.map((r) => ({
+        sku: r.sku,
+        title: r.title || r.sku,
+        productId: r.productId,
+        confidence: r.confidence,
+      })),
+      avgConfidence: (avgConfidence * 100).toFixed(1),
     });
   }
 
-  // Sort by co-purchase rate, take top 20
-  bundleSuggestions.sort((a, b) => b.coPurchaseRate - a.coPurchaseRate);
-  const topBundles = bundleSuggestions.slice(0, 20);
-
   return {
-    clickCount,
-    impressionCount,
-    addToCartCount,
-    ctr,
-    topPairs,
-    topBundles,
+    shopDomain,
+    bundleSuggestions,
   };
 };
 
 export default function Analytics() {
-  const {
-    clickCount,
-    impressionCount,
-    addToCartCount,
-    ctr,
-    topPairs,
-    topBundles,
-  } = useLoaderData();
+  const { shopDomain, bundleSuggestions } = useLoaderData();
 
-  const pairRows = topPairs.map((pair) => [
-    pair.sourceProduct,
-    pair.recommendedProduct,
-    pair._count.id.toLocaleString(),
-  ]);
-
-  const bundleRows = topBundles.map((bundle, i) => [
-    i + 1,
-    bundle.products.join(" + "),
-    `${bundle.coPurchaseRate}%`,
-  ]);
+  function adminProductUrl(productId) {
+    const numericId = productId?.split("/").pop();
+    return `https://admin.shopify.com/store/${shopDomain}/products/${numericId}`;
+  }
 
   return (
     <Page title="Analytics">
       <Layout>
-        {/* Overview stats */}
-        <Layout.Section>
-          <InlineGrid columns={4} gap="400">
-            <Card>
-              <BlockStack gap="100">
-                <Text tone="subdued">Impressions</Text>
-                <Text variant="heading2xl">{impressionCount.toLocaleString()}</Text>
-              </BlockStack>
-            </Card>
-            <Card>
-              <BlockStack gap="100">
-                <Text tone="subdued">Clicks</Text>
-                <Text variant="heading2xl">{clickCount.toLocaleString()}</Text>
-              </BlockStack>
-            </Card>
-            <Card>
-              <BlockStack gap="100">
-                <Text tone="subdued">Add to cart</Text>
-                <Text variant="heading2xl">{addToCartCount.toLocaleString()}</Text>
-              </BlockStack>
-            </Card>
-            <Card>
-              <BlockStack gap="100">
-                <Text tone="subdued">Click-through rate</Text>
-                <Text variant="heading2xl">{ctr}%</Text>
-              </BlockStack>
-            </Card>
-          </InlineGrid>
-        </Layout.Section>
-
-        {/* Top recommendation pairs */}
-        <Layout.Section>
-          <Card>
-            <BlockStack gap="300">
-              <Text variant="headingMd">Top Recommendation Pairs</Text>
-              <Text tone="subdued">Most clicked A → B recommendation pairs.</Text>
-              {topPairs.length === 0 ? (
-                <EmptyState heading="No click data yet" image="">
-                  <p>Data will appear once customers start interacting with recommendations.</p>
-                </EmptyState>
-              ) : (
-                <DataTable
-                  columnContentTypes={["text", "text", "numeric"]}
-                  headings={["Source product", "Recommended product", "Clicks"]}
-                  rows={pairRows}
-                />
-              )}
-            </BlockStack>
-          </Card>
-        </Layout.Section>
-
         {/* Bundle suggestions */}
         <Layout.Section>
           <Card>
-            <BlockStack gap="300">
-              <Text variant="headingMd">Bundle Suggestions</Text>
-              <Text tone="subdued">
-                Product groups frequently purchased together, based on training data.
-              </Text>
-              {topBundles.length === 0 ? (
+            <BlockStack gap="400">
+              <BlockStack gap="100">
+                <Text variant="headingMd">Bundle Suggestions</Text>
+                <Text tone="subdued">
+                  Top 10 product groups frequently purchased together, based on training data.
+                  Click any product title to open it in Shopify Admin.
+                </Text>
+              </BlockStack>
+
+              {bundleSuggestions.length === 0 ? (
                 <EmptyState heading="No training data yet" image="">
                   <p>Run your first training to see bundle suggestions.</p>
                 </EmptyState>
               ) : (
-                <DataTable
-                  columnContentTypes={["numeric", "text", "text"]}
-                  headings={["#", "Products", "Co-purchase rate"]}
-                  rows={bundleRows}
-                />
+                <InlineGrid columns={2} gap="400">
+                  {bundleSuggestions.map((bundle, i) => (
+                    <Card key={i} background="bg-surface-secondary">
+                      <BlockStack gap="300">
+                        <InlineStack align="space-between">
+                          <Text variant="headingSm">Bundle {i + 1}</Text>
+                          <Badge tone="success">{bundle.avgConfidence}% match</Badge>
+                        </InlineStack>
+
+                        <BlockStack gap="200">
+                          {/* Source product */}
+                          <InlineStack gap="200" align="start">
+                            <Text tone="subdued" variant="bodySm">Source</Text>
+                            <Link
+                              url={adminProductUrl(bundle.source.productId)}
+                              target="_blank"
+                              removeUnderline
+                            >
+                              <Text variant="bodySm" fontWeight="semibold">
+                                {bundle.source.title}
+                              </Text>
+                            </Link>
+                          </InlineStack>
+
+                          {/* Recommended products */}
+                          {bundle.recommendations.map((rec, j) => (
+                            <InlineStack key={j} gap="200" align="start">
+                              <Text tone="subdued" variant="bodySm">
+                                +{(rec.confidence * 100).toFixed(1)}%
+                              </Text>
+                              <Link
+                                url={adminProductUrl(rec.productId)}
+                                target="_blank"
+                                removeUnderline
+                              >
+                                <Text variant="bodySm">
+                                  {rec.title}
+                                </Text>
+                              </Link>
+                            </InlineStack>
+                          ))}
+                        </BlockStack>
+                      </BlockStack>
+                    </Card>
+                  ))}
+                </InlineGrid>
               )}
             </BlockStack>
           </Card>
