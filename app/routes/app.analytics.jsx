@@ -1,4 +1,4 @@
-import { useLoaderData } from "react-router";
+import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import { PrismaClient } from "@prisma/client";
 import {
@@ -12,7 +12,12 @@ import {
   InlineStack,
   Badge,
   Link,
+  TextField,
+  Button,
+  Banner,
+  Divider,
 } from "@shopify/polaris";
+import { useState } from "react";
 
 const prisma = new PrismaClient();
 
@@ -65,27 +70,21 @@ export const loader = async ({ request }) => {
     const confidences = rec.confidence;
     if (!ids || ids.length === 0) continue;
 
-    // Take top 3 recommended products, excluding same product as source
     const topRecs = [];
     for (let i = 0; i < Math.min(ids.length, 10); i++) {
       const info = skuMap[ids[i]];
       if (!info) continue;
-
-      // Skip if same product as source (catches different variants of same product)
       if (info.productId === sourceInfo.productId) continue;
-
       topRecs.push({
         sku: ids[i],
         confidence: confidences[i] || 0,
         ...info,
       });
-
       if (topRecs.length >= 3) break;
     }
 
     if (topRecs.length === 0) continue;
 
-    // Deduplicate by product ID within the bundle
     const uniqueProductIds = new Set([sourceInfo.productId]);
     const deduplicatedRecs = topRecs.filter((r) => {
       if (uniqueProductIds.has(r.productId)) return false;
@@ -95,7 +94,6 @@ export const loader = async ({ request }) => {
 
     if (deduplicatedRecs.length === 0) continue;
 
-    // Build bundle key using product IDs (not SKUs) to catch variant duplicates
     const allProductIds = [sourceInfo.productId, ...deduplicatedRecs.map((r) => r.productId)].sort();
     const bundleKey = allProductIds.join("|");
     if (seen.has(bundleKey)) continue;
@@ -126,8 +124,73 @@ export const loader = async ({ request }) => {
   };
 };
 
+export const action = async ({ request }) => {
+  await authenticate.admin(request);
+
+  const formData = await request.formData();
+  const sku = formData.get("sku")?.trim();
+
+  if (!sku) {
+    return { error: "Please enter a SKU." };
+  }
+
+  const rec = await prisma.recommendation.findUnique({
+    where: { productId: sku },
+  });
+
+  if (!rec) {
+    return { error: `No recommendation data found for SKU: ${sku}` };
+  }
+
+  const skuMappings = await prisma.skuToHandle.findMany({
+    where: { productId: { not: null } },
+  });
+  const skuMap = Object.fromEntries(
+    skuMappings.map((m) => [m.sku, {
+      handle: m.handle,
+      title: m.title,
+      productId: m.productId,
+    }])
+  );
+
+  const sourceInfo = skuMap[sku];
+
+  // Get top 5 recommendations, excluding same product as source
+  const results = [];
+  for (let i = 0; i < Math.min(rec.recommendedIds.length, 20); i++) {
+    const info = skuMap[rec.recommendedIds[i]];
+    if (!info) continue;
+    if (sourceInfo && info.productId === sourceInfo.productId) continue;
+
+    // Deduplicate by product ID
+    if (results.some((r) => r.productId === info.productId)) continue;
+
+    results.push({
+      sku: rec.recommendedIds[i],
+      title: info.title || rec.recommendedIds[i],
+      productId: info.productId,
+      handle: info.handle,
+      confidence: rec.confidence[i] || 0,
+    });
+
+    if (results.length >= 5) break;
+  }
+
+  return {
+    sku,
+    sourceTitle: sourceInfo?.title || sku,
+    sourceProductId: sourceInfo?.productId || null,
+    results,
+  };
+};
+
 export default function Analytics() {
   const { shopDomain, bundleSuggestions } = useLoaderData();
+  const fetcher = useFetcher();
+  const [skuInput, setSkuInput] = useState("");
+
+  const isSearching = fetcher.state !== "idle";
+  const searchResult = fetcher.data;
 
   function adminProductUrl(productId) {
     const numericId = productId?.split("/").pop();
@@ -137,6 +200,91 @@ export default function Analytics() {
   return (
     <Page title="Analytics">
       <Layout>
+
+        {/* SKU lookup */}
+        <Layout.Section>
+          <Card>
+            <BlockStack gap="400">
+              <BlockStack gap="100">
+                <Text variant="headingMd">Product Recommendation Lookup</Text>
+                <Text tone="subdued">
+                  Enter a SKU to see the top 5 products most frequently purchased with it.
+                </Text>
+              </BlockStack>
+
+              <fetcher.Form method="post">
+                <InlineStack gap="300" align="start">
+                  <div style={{ flex: 1 }}>
+                    <TextField
+                      label="SKU"
+                      labelHidden
+                      name="sku"
+                      value={skuInput}
+                      onChange={setSkuInput}
+                      placeholder="e.g. 817513015472"
+                      autoComplete="off"
+                    />
+                  </div>
+                  <Button
+                    variant="primary"
+                    submit
+                    loading={isSearching}
+                    disabled={isSearching || !skuInput.trim()}
+                  >
+                    Look up
+                  </Button>
+                </InlineStack>
+              </fetcher.Form>
+
+              {searchResult && (
+                <>
+                  <Divider />
+                  {searchResult.error ? (
+                    <Banner tone="critical">{searchResult.error}</Banner>
+                  ) : (
+                    <BlockStack gap="300">
+                      <InlineStack gap="200" align="start">
+                        <Text tone="subdued">Source product:</Text>
+                        <Link
+                          url={adminProductUrl(searchResult.sourceProductId)}
+                          target="_blank"
+                          removeUnderline
+                        >
+                          <Text fontWeight="semibold">{searchResult.sourceTitle}</Text>
+                        </Link>
+                        <Text tone="subdued">({searchResult.sku})</Text>
+                      </InlineStack>
+
+                      {searchResult.results.length === 0 ? (
+                        <Text tone="subdued">No recommendations found for this SKU.</Text>
+                      ) : (
+                        <BlockStack gap="200">
+                          {searchResult.results.map((r, i) => (
+                            <InlineStack key={i} gap="400" align="start">
+                              <Badge tone="success">
+                                {(r.confidence * 100).toFixed(1)}% match
+                              </Badge>
+                              <Link
+                                url={adminProductUrl(r.productId)}
+                                target="_blank"
+                                removeUnderline
+                              >
+                                <Text>{r.title}</Text>
+                              </Link>
+                              <Text tone="subdued" variant="bodySm">{r.sku}</Text>
+                            </InlineStack>
+                          ))}
+                        </BlockStack>
+                      )}
+                    </BlockStack>
+                  )}
+                </>
+              )}
+            </BlockStack>
+          </Card>
+        </Layout.Section>
+
+        {/* Bundle suggestions */}
         <Layout.Section>
           <Card>
             <BlockStack gap="400">
@@ -201,6 +349,7 @@ export default function Analytics() {
             </BlockStack>
           </Card>
         </Layout.Section>
+
       </Layout>
     </Page>
   );
