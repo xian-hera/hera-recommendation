@@ -181,23 +181,17 @@ async function mergeRecommendations(newRecs, historyWeight, newDataWeight) {
 async function queueMetafieldSync(changedSkus) {
   if (changedSkus.length === 0) return 0;
 
-  // Load SKU to handle + productId mapping
   const skuMappings = await prisma.skuToHandle.findMany({
-    where: {
-      sku: { in: changedSkus },
-      productId: { not: null },
-    },
+    where: { sku: { in: changedSkus }, productId: { not: null } },
   });
   const skuToProductMap = Object.fromEntries(
     skuMappings.map((m) => [m.sku, m.productId])
   );
 
-  // Load recommendations for changed SKUs
   const recommendations = await prisma.recommendation.findMany({
     where: { productId: { in: changedSkus } },
   });
 
-  // Load all SKU to handle mapping for converting recommended SKUs to handles
   const allSkuMappings = await prisma.skuToHandle.findMany({
     where: { productId: { not: null } },
   });
@@ -216,12 +210,13 @@ async function queueMetafieldSync(changedSkus) {
 
     if (handles.length === 0) continue;
 
-    // Upsert to avoid duplicates if training runs multiple times
     await prisma.metafieldSyncQueue.upsert({
-      where: { id: (await prisma.metafieldSyncQueue.findFirst({
-        where: { productId, status: "pending" },
-        select: { id: true },
-      }))?.id ?? -1 },
+      where: {
+        id: (await prisma.metafieldSyncQueue.findFirst({
+          where: { productId, status: "pending" },
+          select: { id: true },
+        }))?.id ?? -1,
+      },
       update: { handles, attempts: 0, errorMsg: null, status: "pending" },
       create: { productId, handles, status: "pending" },
     });
@@ -235,26 +230,30 @@ async function queueMetafieldSync(changedSkus) {
 /**
  * Main incremental training function
  * @param {object} admin - Shopify admin API client
- * @param {string|null} sinceDateOverride - ISO date string to override the auto-detected since date
- * @param {boolean} syncOnly - If true, only sync SKU->handle mapping, skip training
+ * @param {string|null} sinceDateOverride - ISO date string to override since date
+ * @param {boolean} syncOnly - If true, only sync SKU->handle mapping
+ * @param {string} triggeredBy - 'manual' | 'cron'
  */
-export async function runIncrementalTraining(admin, sinceDateOverride = null, syncOnly = false) {
+export async function runIncrementalTraining(
+  admin,
+  sinceDateOverride = null,
+  syncOnly = false,
+  triggeredBy = "manual"
+) {
   const startTime = Date.now();
 
-  // Get settings
   const settingsRows = await prisma.setting.findMany();
   const settings = Object.fromEntries(settingsRows.map((s) => [s.key, s.value]));
   const historyWeight = Number(settings["history_weight"] ?? 0.8);
   const newDataWeight = Number(settings["new_data_weight"] ?? 0.2);
 
-  // Sync SKU to handle mapping first
   const { syncSkuToHandle } = await import("./sync-sku-handle.server.js");
   await syncSkuToHandle(admin);
 
   if (syncOnly) {
     await prisma.trainingLog.create({
       data: {
-        triggeredBy: "manual",
+        triggeredBy,
         ordersCount: 0,
         status: "success",
         durationMs: Date.now() - startTime,
@@ -265,17 +264,18 @@ export async function runIncrementalTraining(admin, sinceDateOverride = null, sy
   }
 
   // Determine since date
+  // For cron, look at last cron training; for manual, look at last manual training
   let sinceDate;
   if (sinceDateOverride) {
     sinceDate = new Date(sinceDateOverride);
     console.log(`Using user-provided since date: ${sinceDate.toISOString()}`);
   } else {
-    const lastIncremental = await prisma.trainingLog.findFirst({
-      where: { triggeredBy: "manual", status: "success", errorMsg: null },
+    const lastTraining = await prisma.trainingLog.findFirst({
+      where: { triggeredBy, status: "success", errorMsg: null },
       orderBy: { createdAt: "desc" },
     });
-    sinceDate = lastIncremental
-      ? new Date(lastIncremental.createdAt)
+    sinceDate = lastTraining
+      ? new Date(lastTraining.createdAt)
       : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     console.log(`Auto-detected since date: ${sinceDate.toISOString()}`);
   }
@@ -290,7 +290,7 @@ export async function runIncrementalTraining(admin, sinceDateOverride = null, sy
       console.log("No new orders found, skipping training.");
       await prisma.trainingLog.create({
         data: {
-          triggeredBy: "manual",
+          triggeredBy,
           ordersCount: 0,
           status: "success",
           durationMs: Date.now() - startTime,
@@ -315,12 +315,11 @@ export async function runIncrementalTraining(admin, sinceDateOverride = null, sy
       newDataWeight
     );
 
-    // Queue changed products for metafield sync (non-blocking)
     const queued = await queueMetafieldSync(changedSkus);
 
     await prisma.trainingLog.create({
       data: {
-        triggeredBy: "manual",
+        triggeredBy,
         ordersCount,
         status: "success",
         durationMs: Date.now() - startTime,
@@ -339,7 +338,7 @@ export async function runIncrementalTraining(admin, sinceDateOverride = null, sy
     console.error("Incremental training failed:", err);
     await prisma.trainingLog.create({
       data: {
-        triggeredBy: "manual",
+        triggeredBy,
         ordersCount,
         status: "failed",
         durationMs: Date.now() - startTime,
