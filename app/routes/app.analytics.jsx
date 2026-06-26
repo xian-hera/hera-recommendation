@@ -16,7 +16,6 @@ import {
 
 const prisma = new PrismaClient();
 
-// Get shop domain for admin links
 function getShopDomain(shop) {
   return shop?.replace(".myshopify.com", "") || "";
 }
@@ -24,20 +23,17 @@ function getShopDomain(shop) {
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
 
-  // Get session for shop domain
   const session = await prisma.session.findFirst({
     where: { isOnline: false },
     orderBy: { expires: "desc" },
   });
   const shopDomain = getShopDomain(session?.shop);
 
-  // Load top recommendations by confidence
   const topRecommendations = await prisma.recommendation.findMany({
     orderBy: { updatedAt: "desc" },
     take: 500,
   });
 
-  // Load SKU to handle + title + productId mapping
   const skuMappings = await prisma.skuToHandle.findMany({
     where: { productId: { not: null } },
   });
@@ -49,13 +45,9 @@ export const loader = async ({ request }) => {
     }])
   );
 
-  // Build bundle suggestions
-  // Each bundle = source product + top 1-3 recommended products
-  // Score = average confidence of the group
   const bundleSuggestions = [];
   const seen = new Set();
 
-  // Sort all recommendations by their top confidence score
   const sorted = topRecommendations
     .map((rec) => {
       const topConfidence = rec.confidence?.[0] ?? 0;
@@ -73,30 +65,44 @@ export const loader = async ({ request }) => {
     const confidences = rec.confidence;
     if (!ids || ids.length === 0) continue;
 
-    // Take top 3 recommended products that have valid mappings
+    // Take top 3 recommended products, excluding same product as source
     const topRecs = [];
-    for (let i = 0; i < Math.min(ids.length, 5); i++) {
+    for (let i = 0; i < Math.min(ids.length, 10); i++) {
       const info = skuMap[ids[i]];
-      if (info) {
-        topRecs.push({
-          sku: ids[i],
-          confidence: confidences[i] || 0,
-          ...info,
-        });
-      }
+      if (!info) continue;
+
+      // Skip if same product as source (catches different variants of same product)
+      if (info.productId === sourceInfo.productId) continue;
+
+      topRecs.push({
+        sku: ids[i],
+        confidence: confidences[i] || 0,
+        ...info,
+      });
+
       if (topRecs.length >= 3) break;
     }
 
     if (topRecs.length === 0) continue;
 
-    // Build bundle key to avoid duplicates
-    const allSkus = [rec.productId, ...topRecs.map((r) => r.sku)].sort();
-    const bundleKey = allSkus.join("|");
+    // Deduplicate by product ID within the bundle
+    const uniqueProductIds = new Set([sourceInfo.productId]);
+    const deduplicatedRecs = topRecs.filter((r) => {
+      if (uniqueProductIds.has(r.productId)) return false;
+      uniqueProductIds.add(r.productId);
+      return true;
+    });
+
+    if (deduplicatedRecs.length === 0) continue;
+
+    // Build bundle key using product IDs (not SKUs) to catch variant duplicates
+    const allProductIds = [sourceInfo.productId, ...deduplicatedRecs.map((r) => r.productId)].sort();
+    const bundleKey = allProductIds.join("|");
     if (seen.has(bundleKey)) continue;
     seen.add(bundleKey);
 
     const avgConfidence =
-      topRecs.reduce((sum, r) => sum + r.confidence, 0) / topRecs.length;
+      deduplicatedRecs.reduce((sum, r) => sum + r.confidence, 0) / deduplicatedRecs.length;
 
     bundleSuggestions.push({
       source: {
@@ -104,7 +110,7 @@ export const loader = async ({ request }) => {
         title: sourceInfo.title || rec.productId,
         productId: sourceInfo.productId,
       },
-      recommendations: topRecs.map((r) => ({
+      recommendations: deduplicatedRecs.map((r) => ({
         sku: r.sku,
         title: r.title || r.sku,
         productId: r.productId,
@@ -131,7 +137,6 @@ export default function Analytics() {
   return (
     <Page title="Analytics">
       <Layout>
-        {/* Bundle suggestions */}
         <Layout.Section>
           <Card>
             <BlockStack gap="400">
@@ -158,7 +163,6 @@ export default function Analytics() {
                         </InlineStack>
 
                         <BlockStack gap="200">
-                          {/* Source product */}
                           <InlineStack gap="200" align="start">
                             <Text tone="subdued" variant="bodySm">Source</Text>
                             <Link
@@ -172,7 +176,6 @@ export default function Analytics() {
                             </Link>
                           </InlineStack>
 
-                          {/* Recommended products */}
                           {bundle.recommendations.map((rec, j) => (
                             <InlineStack key={j} gap="200" align="start">
                               <Text tone="subdued" variant="bodySm">
