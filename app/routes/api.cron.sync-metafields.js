@@ -1,8 +1,9 @@
 /**
  * Metafield sync cron endpoint
- * Called hourly by Render Cron Job
+ * Called by Render Cron Job every 6 hours
  * Checks settings to decide whether to actually run
- * Processes up to 100 pending items from metafield_sync_queue per run
+ * Processes ALL pending items from metafield_sync_queue per run
+ * At 1 batch/sec (25 metafields/batch), 10000 items ≈ 7 minutes
  * Protected by CRON_SECRET token
  */
 
@@ -10,8 +11,6 @@ import { PrismaClient } from "@prisma/client";
 import { unauthenticated } from "../shopify.server.js";
 
 const prisma = new PrismaClient();
-
-const BATCH_SIZE = 100;
 const METAFIELD_BATCH = 25;
 
 function sleep(ms) {
@@ -61,9 +60,8 @@ export const action = async ({ request }) => {
     const settingsRows = await prisma.setting.findMany();
     const settings = Object.fromEntries(settingsRows.map((s) => [s.key, s.value]));
 
-    // If triggered by cron (not manual), check settings
+    // If triggered by cron (not manual), check interval setting
     if (triggeredBy === "cron") {
-      // Check if auto sync is enabled
       if (settings["auto_sync_enabled"] !== "true") {
         return Response.json({
           success: true,
@@ -72,8 +70,7 @@ export const action = async ({ request }) => {
         });
       }
 
-      // Check if enough hours have passed since last sync
-      const intervalHours = Number(settings["auto_sync_interval_hours"] ?? 1);
+      const intervalHours = Number(settings["auto_sync_interval_hours"] ?? 6);
       const lastCronSync = await prisma.syncLog.findFirst({
         where: { triggeredBy: "cron", status: "success" },
         orderBy: { createdAt: "desc" },
@@ -94,7 +91,7 @@ export const action = async ({ request }) => {
       }
     }
 
-    // Check if there are pending items
+    // Check pending count
     const pendingCount = await prisma.metafieldSyncQueue.count({
       where: { status: "pending" },
     });
@@ -106,6 +103,8 @@ export const action = async ({ request }) => {
         duration: Date.now() - startTime,
       });
     }
+
+    console.log(`Processing all ${pendingCount} pending metafield sync items...`);
 
     // Get Shopify session
     const session = await prisma.session.findFirst({
@@ -119,13 +118,11 @@ export const action = async ({ request }) => {
 
     const { admin } = await unauthenticated.admin(session.shop);
 
+    // Fetch ALL pending items
     const pending = await prisma.metafieldSyncQueue.findMany({
       where: { status: "pending" },
       orderBy: { createdAt: "asc" },
-      take: BATCH_SIZE,
     });
-
-    console.log(`Processing ${pending.length} pending metafield sync items...`);
 
     let synced = 0;
     let failed = 0;
@@ -161,7 +158,12 @@ export const action = async ({ request }) => {
         failed += batch.length;
       }
 
+      // 1 second between batches to respect Shopify rate limits
       await sleep(1000);
+
+      if (synced % 500 === 0 && synced > 0) {
+        console.log(`Progress: ${synced} / ${pending.length}`);
+      }
     }
 
     const remaining = await prisma.metafieldSyncQueue.count({
@@ -186,7 +188,7 @@ export const action = async ({ request }) => {
       failed,
       remaining,
       duration,
-      message: `Processed ${synced} items. ${remaining} remaining in queue.`,
+      message: `Processed ${synced} / ${pending.length} items in ${Math.round(duration / 1000)}s. ${remaining} remaining.`,
     });
   } catch (err) {
     console.error("Metafield sync cron failed:", err);
