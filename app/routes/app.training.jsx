@@ -103,6 +103,7 @@ export const action = async ({ request }) => {
     const appUrl = process.env.SHOPIFY_APP_URL || "";
     // eslint-disable-next-line no-undef
     const cronSecret = process.env.CRON_SECRET || "";
+    console.log("DEBUG appUrl:", appUrl, "| cronSecret length:", cronSecret?.length);
     const res = await fetch(`${appUrl}/api/cron/sync-metafields`, {
       method: "POST",
       headers: {
