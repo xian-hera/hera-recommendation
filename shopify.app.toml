@@ -6,7 +6,7 @@ embedded = true
 name = "Hera Recommendation"
 
 [access_scopes]
-scopes = "read_all_orders,read_customers,read_orders,read_products,write_products"
+scopes = "read_all_orders,read_customers,read_inventory,read_locations,read_orders,read_products,write_products"
 optional_scopes = []
 use_legacy_install_flow = false
 
