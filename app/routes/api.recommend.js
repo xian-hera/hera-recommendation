@@ -206,26 +206,28 @@ export const loader = async ({ request }) => {
       .slice(0, recommendCount)
       .map(([sku]) => sku);
 
-    // Fallback: fill remaining slots with highest-confidence products globally
+    // Fallback: fill remaining slots with highest-confidence recommended products globally
     if (topSkus.length < recommendCount) {
       const needed = recommendCount - topSkus.length;
       const existing = new Set(topSkus);
 
-      const topGlobal = await prisma.$queryRaw`
-        SELECT product_id, confidence
+      const topRecs = await prisma.$queryRaw`
+        SELECT
+          (recommended_ids->>0) as top_sku,
+          confidence[1] as top_confidence
         FROM recommendations
-        WHERE confidence[1] IS NOT NULL
+        WHERE jsonb_array_length(recommended_ids) > 0
+          AND confidence[1] IS NOT NULL
         ORDER BY confidence[1] DESC
         LIMIT ${needed * 10}
       `;
 
-      for (const rec of topGlobal) {
+      for (const rec of topRecs) {
         if (topSkus.length >= recommendCount) break;
-        const sku = rec.product_id;
-        if (!existing.has(sku)) {
-          topSkus.push(sku);
-          existing.add(sku);
-        }
+        const sku = rec.top_sku;
+        if (!sku || existing.has(sku)) continue;
+        topSkus.push(sku);
+        existing.add(sku);
       }
     }
 
