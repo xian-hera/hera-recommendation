@@ -152,13 +152,6 @@ export const loader = async ({ request }) => {
     );
   }
 
-  // Require at least one signal
-  if (!productSku && !customerId && !viewedParam) {
-    return Response.json(
-      { error: "Missing signal: provide product, customer, or viewed" },
-      { status: 400, headers: corsHeaders }
-    );
-  }
 
   try {
     // Get settings
