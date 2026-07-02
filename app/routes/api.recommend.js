@@ -214,18 +214,20 @@ export const loader = async ({ request }) => {
       const needed = recommendCount - topSkus.length;
       const existing = new Set(topSkus);
 
-      const topGlobal = await prisma.recommendation.findMany({
-        orderBy: { confidence: 'desc' },
-        take: needed * 10,
-      });
+    const topGlobal = await prisma.$queryRaw`
+      SELECT product_id, recommended_ids, confidence
+      FROM recommendations
+      WHERE confidence[1] IS NOT NULL
+      ORDER BY confidence[1] DESC
+      LIMIT ${needed * 10}
+    `;
 
-      for (const rec of topGlobal) {
-        if (topSkus.length >= recommendCount) break;
-        const sku = rec.productId;
-        if (!existing.has(sku)) {
-          topSkus.push(sku);
-          existing.add(sku);
-        }
+    for (const rec of topGlobal) {
+      if (topSkus.length >= recommendCount) break;
+      const sku = rec.product_id;
+      if (!existing.has(sku)) {
+        topSkus.push(sku);
+        existing.add(sku);
       }
     }
 
