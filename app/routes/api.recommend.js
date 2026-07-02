@@ -31,7 +31,6 @@ async function getSkusFromProductIds(admin, productIds) {
   if (!productIds || productIds.length === 0) return [];
 
   const skus = [];
-  // Query in batches of 10
   const batches = [];
   for (let i = 0; i < productIds.length; i += 10) {
     batches.push(productIds.slice(i, i + 10));
@@ -112,7 +111,6 @@ async function getLastOrderSkus(admin, customerId) {
     .map((e) => e.node.variant?.sku?.trim())
     .filter(Boolean);
 
-  // Randomly pick 2 SKUs
   const shuffled = skus.sort(() => Math.random() - 0.5);
   return shuffled.slice(0, 2);
 }
@@ -152,7 +150,6 @@ export const loader = async ({ request }) => {
     );
   }
 
-
   try {
     // Get settings
     const settingsRows = await prisma.setting.findMany();
@@ -182,7 +179,7 @@ export const loader = async ({ request }) => {
         .split(",")
         .map((id) => id.trim())
         .filter(Boolean)
-        .slice(0, 5); // take last 5 viewed
+        .slice(0, 5);
 
       const viewedSkus = await getSkusFromProductIds(admin, viewedIds);
       const scores = await scoreSkus(viewedSkus, browseWeight);
@@ -209,25 +206,26 @@ export const loader = async ({ request }) => {
       .slice(0, recommendCount)
       .map(([sku]) => sku);
 
-    // Fallback: fill remaining slots with highest-confidence recommendations globally
+    // Fallback: fill remaining slots with highest-confidence products globally
     if (topSkus.length < recommendCount) {
       const needed = recommendCount - topSkus.length;
       const existing = new Set(topSkus);
 
-    const topGlobal = await prisma.$queryRaw`
-      SELECT product_id, recommended_ids, confidence
-      FROM recommendations
-      WHERE confidence[1] IS NOT NULL
-      ORDER BY confidence[1] DESC
-      LIMIT ${needed * 10}
-    `;
+      const topGlobal = await prisma.$queryRaw`
+        SELECT product_id, confidence
+        FROM recommendations
+        WHERE confidence[1] IS NOT NULL
+        ORDER BY confidence[1] DESC
+        LIMIT ${needed * 10}
+      `;
 
-    for (const rec of topGlobal) {
-      if (topSkus.length >= recommendCount) break;
-      const sku = rec.product_id;
-      if (!existing.has(sku)) {
-        topSkus.push(sku);
-        existing.add(sku);
+      for (const rec of topGlobal) {
+        if (topSkus.length >= recommendCount) break;
+        const sku = rec.product_id;
+        if (!existing.has(sku)) {
+          topSkus.push(sku);
+          existing.add(sku);
+        }
       }
     }
 
@@ -240,6 +238,7 @@ export const loader = async ({ request }) => {
       skuMappings.map((m) => [m.sku, { handle: m.handle, title: m.title }])
     );
 
+    // Deduplicate by handle
     const seenHandles = new Set();
     const results = topSkus
       .filter((sku) => skuToHandleMap[sku])
