@@ -212,18 +212,14 @@ export const loader = async ({ request }) => {
       const existing = new Set(topSkus);
 
       const topRecs = await prisma.$queryRaw`
-        SELECT
-          (recommended_ids->>0) as top_sku,
-          confidence[1] as top_confidence
-        FROM recommendations
-        WHERE jsonb_array_length(recommended_ids) > 0
-          AND confidence[1] IS NOT NULL
-        ORDER BY confidence[1] DESC
+        SELECT r.recommended_ids->>0 as top_sku, r.confidence[1] as top_confidence
+        FROM recommendations r
+        INNER JOIN sku_to_handle s ON s.sku = (r.recommended_ids->>0)
+        WHERE jsonb_array_length(r.recommended_ids) > 0
+          AND r.confidence[1] IS NOT NULL
+        ORDER BY r.confidence[1] DESC
         LIMIT ${needed * 10}
       `;
-
-      console.log('[Fallback] topSkus before fallback:', topSkus.length, topSkus.slice(0, 3));
-      console.log('[Fallback] topRecs from DB:', topRecs.length, topRecs.slice(0, 3));
 
       for (const rec of topRecs) {
         if (topSkus.length >= recommendCount) break;
@@ -232,16 +228,12 @@ export const loader = async ({ request }) => {
         topSkus.push(sku);
         existing.add(sku);
       }
-
-      console.log('[Fallback] topSkus after fallback:', topSkus.length, topSkus.slice(0, 3));
     }
 
     // Convert SKUs to handles
     const skuMappings = await prisma.skuToHandle.findMany({
       where: { sku: { in: topSkus } },
     });
-
-    console.log('[Fallback] skuMappings found:', skuMappings.length, 'for topSkus:', topSkus.length);
 
     const skuToHandleMap = Object.fromEntries(
       skuMappings.map((m) => [m.sku, { handle: m.handle, title: m.title }])
