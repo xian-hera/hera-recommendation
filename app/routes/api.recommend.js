@@ -211,10 +211,30 @@ export const loader = async ({ request }) => {
     if (productSku) merged.delete(productSku);
 
     // Sort and take top N
-    const topSkus = [...merged.entries()]
+    let topSkus = [...merged.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, recommendCount)
       .map(([sku]) => sku);
+
+    // Fallback: fill remaining slots with highest-confidence recommendations globally
+    if (topSkus.length < recommendCount) {
+      const needed = recommendCount - topSkus.length;
+      const existing = new Set(topSkus);
+
+      const topGlobal = await prisma.recommendation.findMany({
+        orderBy: { confidence: 'desc' },
+        take: needed * 10,
+      });
+
+      for (const rec of topGlobal) {
+        if (topSkus.length >= recommendCount) break;
+        const sku = rec.productId;
+        if (!existing.has(sku)) {
+          topSkus.push(sku);
+          existing.add(sku);
+        }
+      }
+    }
 
     // Convert SKUs to handles
     const skuMappings = await prisma.skuToHandle.findMany({
