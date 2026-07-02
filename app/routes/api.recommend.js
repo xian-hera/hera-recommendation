@@ -225,6 +225,7 @@ export const loader = async ({ request }) => {
       skuMappings.map((m) => [m.sku, { handle: m.handle, title: m.title }])
     );
 
+    const seenHandles = new Set();
     const results = topSkus
       .filter((sku) => skuToHandleMap[sku])
       .map((sku) => ({
@@ -232,7 +233,12 @@ export const loader = async ({ request }) => {
         handle: skuToHandleMap[sku].handle,
         title: skuToHandleMap[sku].title,
         score: Math.round((merged.get(sku) || 0) * 1000) / 1000,
-      }));
+      }))
+      .filter((item) => {
+        if (seenHandles.has(item.handle)) return false;
+        seenHandles.add(item.handle);
+        return true;
+      });
 
     return Response.json(
       {
