@@ -222,6 +222,9 @@ export const loader = async ({ request }) => {
         LIMIT ${needed * 10}
       `;
 
+      console.log('[Fallback] topSkus before fallback:', topSkus.length, topSkus.slice(0, 3));
+      console.log('[Fallback] topRecs from DB:', topRecs.length, topRecs.slice(0, 3));
+
       for (const rec of topRecs) {
         if (topSkus.length >= recommendCount) break;
         const sku = rec.top_sku;
@@ -229,12 +232,16 @@ export const loader = async ({ request }) => {
         topSkus.push(sku);
         existing.add(sku);
       }
+
+      console.log('[Fallback] topSkus after fallback:', topSkus.length, topSkus.slice(0, 3));
     }
 
     // Convert SKUs to handles
     const skuMappings = await prisma.skuToHandle.findMany({
       where: { sku: { in: topSkus } },
     });
+
+    console.log('[Fallback] skuMappings found:', skuMappings.length, 'for topSkus:', topSkus.length);
 
     const skuToHandleMap = Object.fromEntries(
       skuMappings.map((m) => [m.sku, { handle: m.handle, title: m.title }])
