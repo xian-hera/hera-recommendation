@@ -212,12 +212,12 @@ export const loader = async ({ request }) => {
       const existing = new Set(topSkus);
 
       const topRecs = await prisma.$queryRaw`
-        SELECT r.recommended_ids->>0 as top_sku, r.confidence[1] as top_confidence
+        SELECT rec_sku as top_sku, COUNT(*) as rec_count
         FROM recommendations r
-        INNER JOIN sku_to_handle s ON s.sku = (r.recommended_ids->>0)
-        WHERE jsonb_array_length(r.recommended_ids) > 0
-          AND r.confidence[1] IS NOT NULL
-        ORDER BY r.confidence[1] DESC
+        CROSS JOIN LATERAL jsonb_array_elements_text(r.recommended_ids) AS rec_sku
+        INNER JOIN sku_to_handle s ON s.sku = rec_sku
+        GROUP BY rec_sku
+        ORDER BY rec_count DESC
         LIMIT ${needed * 10}
       `;
 
