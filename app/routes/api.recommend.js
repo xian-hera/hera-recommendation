@@ -1,10 +1,14 @@
 /**
  * Recommendation API endpoint
- * GET /api/recommend?shop=xxx&product=SKU&customer=yyy&viewed=productId1,productId2
+ * GET /api/recommend?shop=xxx&product=SKU&customer=yyy&viewed=productId1,productId2&count=N
  *
  * - product: current product SKU (product page)
  * - customer: Shopify customer ID (for purchase history)
  * - viewed: comma-separated Shopify product IDs from localStorage (homepage)
+ * - count: optional, how many items the caller wants to display. This is a
+ *   per-request override on top of the admin "Number of recommendations to
+ *   show" setting — whichever is larger wins, so a theme section configured
+ *   to show more than the app-wide default still gets enough candidates.
  */
 
 import { PrismaClient } from "@prisma/client";
@@ -17,6 +21,15 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "GET, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
+
+// How many extra unique products to return beyond the target display count.
+// The storefront can then skip any product that turns out to be unavailable
+// (draft/hidden/deleted) without ending up short — see the theme-side JS.
+const RETURN_BUFFER = 3;
+
+// Sane ceiling for a caller-supplied `count`, so a bad/malicious value can't
+// force a huge fallback query.
+const MAX_REQUESTED_COUNT = 20;
 
 // Handle CORS preflight
 export const action = async ({ request }) => {
@@ -115,8 +128,11 @@ async function getLastOrderSkus(admin, customerId) {
   return shuffled.slice(0, 2);
 }
 
-// Score SKUs from recommendation table
-async function scoreSkus(skus, weight) {
+// Score SKUs from recommendation table. Association rules whose own
+// confidence falls below minConfidence are skipped entirely — this is the
+// admin-configurable "Minimum confidence threshold" from the Settings page,
+// which previously existed in the UI but was never actually read here.
+async function scoreSkus(skus, weight, minConfidence = 0) {
   const scores = new Map();
   for (const sku of skus) {
     const rec = await prisma.recommendation.findUnique({
@@ -124,7 +140,9 @@ async function scoreSkus(skus, weight) {
     });
     if (rec?.recommendedIds) {
       rec.recommendedIds.forEach((id, i) => {
-        const score = (rec.confidence[i] || 0) * weight;
+        const confidence = rec.confidence[i] || 0;
+        if (confidence < minConfidence) return;
+        const score = confidence * weight;
         scores.set(id, (scores.get(id) || 0) + score);
       });
     }
@@ -142,6 +160,7 @@ export const loader = async ({ request }) => {
   const productSku = url.searchParams.get("product");
   const customerId = url.searchParams.get("customer");
   const viewedParam = url.searchParams.get("viewed");
+  const requestedCountParam = url.searchParams.get("count");
 
   if (!shop) {
     return Response.json(
@@ -159,6 +178,21 @@ export const loader = async ({ request }) => {
     const recommendCount = Number(settings["recommendation_count"] ?? 4);
     const browseWeight = Number(settings["browse_weight"] ?? 0.4);
     const purchaseWeight = Number(settings["purchase_weight"] ?? 0.6);
+
+    // A theme section can be configured to show more items than the app's
+    // global "Number of recommendations to show" setting. Respect whichever
+    // is larger so the storefront never asks for more than we try to supply.
+    const requestedCount = Number(requestedCountParam);
+    const displayCount =
+      Number.isFinite(requestedCount) && requestedCount > 0
+        ? Math.max(recommendCount, Math.min(requestedCount, MAX_REQUESTED_COUNT))
+        : recommendCount;
+
+    // Total distinct products we try to gather. We deliberately gather more
+    // than displayCount (see RETURN_BUFFER) so the frontend has spare,
+    // already-ranked candidates to fall back on if a product turns out to be
+    // unavailable when it fetches the product detail.
+    const targetCount = displayCount + RETURN_BUFFER;
 
     // Get Shopify Admin API client
     const { admin } = await unauthenticated.admin(shop);
@@ -197,63 +231,115 @@ export const loader = async ({ request }) => {
       }
     }
 
-    // Remove current product from results
+    // Drop the exact SKU of the current product. Its sibling variants
+    // (other shades/sizes of the same product) are excluded further down
+    // once we know the product's handle.
     if (productSku) merged.delete(productSku);
 
-    // Sort and take top N
-    let topSkus = [...merged.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, recommendCount)
-      .map(([sku]) => sku);
+    // Look up handles for every candidate SKU, plus the current product's
+    // own SKU (so we can exclude ALL of its variants, not just this one
+    // SKU, from the results).
+    const candidateSkus = [...merged.keys()];
+    const lookupSkus = productSku
+      ? [...new Set([...candidateSkus, productSku])]
+      : candidateSkus;
 
-    // Fallback: fill remaining slots with highest-confidence recommended products globally
-    if (topSkus.length < recommendCount) {
-      const needed = recommendCount - topSkus.length;
-      const existing = new Set(topSkus);
-
-      const topRecs = await prisma.$queryRaw`
-        SELECT rec_sku as top_sku, COUNT(*) as rec_count
-        FROM recommendations r
-        CROSS JOIN LATERAL jsonb_array_elements_text(r.recommended_ids) AS rec_sku
-        INNER JOIN sku_to_handle s ON s.sku = rec_sku
-        GROUP BY rec_sku
-        ORDER BY rec_count DESC
-        LIMIT ${needed * 10}
-      `;
-
-      for (const rec of topRecs) {
-        if (topSkus.length >= recommendCount) break;
-        const sku = rec.top_sku;
-        if (!sku || existing.has(sku)) continue;
-        topSkus.push(sku);
-        existing.add(sku);
-      }
-    }
-
-    // Convert SKUs to handles
-    const skuMappings = await prisma.skuToHandle.findMany({
-      where: { sku: { in: topSkus } },
-    });
-
+    const skuMappings = lookupSkus.length
+      ? await prisma.skuToHandle.findMany({
+          where: { sku: { in: lookupSkus } },
+        })
+      : [];
     const skuToHandleMap = Object.fromEntries(
       skuMappings.map((m) => [m.sku, { handle: m.handle, title: m.title }])
     );
 
-    // Deduplicate by handle
+    const currentHandle = productSku
+      ? skuToHandleMap[productSku]?.handle ?? null
+      : null;
+
+    // Walk the fully-ranked candidate list ONCE, deduplicating by product
+    // handle as we go — a product can have several SKUs (one per
+    // variant/shade), and we only ever want to show it once. This replaces
+    // the previous approach of slicing to N SKUs first and deduplicating by
+    // handle afterwards, which is what let the storefront end up with far
+    // fewer items than configured: several of the top-N SKUs would collapse
+    // onto the same handle, and nothing filled the resulting gap.
     const seenHandles = new Set();
-    const results = topSkus
-      .filter((sku) => skuToHandleMap[sku])
-      .map((sku) => ({
+    const results = [];
+
+    const sortedCandidates = [...merged.entries()].sort((a, b) => b[1] - a[1]);
+    for (const [sku, score] of sortedCandidates) {
+      if (results.length >= targetCount) break;
+
+      const mapping = skuToHandleMap[sku];
+      if (!mapping) continue; // SKU not synced to a handle yet — skip it
+      const { handle, title } = mapping;
+      if (handle === currentHandle) continue; // don't recommend the product itself
+      if (seenHandles.has(handle)) continue; // another variant of a product we already picked
+
+      seenHandles.add(handle);
+      results.push({
         sku,
-        handle: skuToHandleMap[sku].handle,
-        title: skuToHandleMap[sku].title,
-        score: Math.round((merged.get(sku) || 0) * 1000) / 1000,
-      }))
-      .filter((item) => {
-        if (seenHandles.has(item.handle)) return false;
-        seenHandles.add(item.handle);
-        return true;
+        handle,
+        title,
+        score: Math.round(score * 1000) / 1000,
       });
+    }
+
+    // Fallback: if personalized signals didn't produce enough distinct
+    // products, fill the rest from the site-wide "most frequently
+    // recommended" pool (i.e. products that show up most often across all
+    // trained association rules — a proxy for popularity, not a literal
+    // Shopify best-sellers report). Deduplication by product handle happens
+    // inside the SQL query itself (DISTINCT-by-handle via ROW_NUMBER), so
+    // this single query already returns at most one row per product — no
+    // dedupe-then-refetch loop needed here.
+    if (results.length < targetCount) {
+      const needed = targetCount - results.length;
+
+      const fallbackRows = await prisma.$queryRaw`
+        WITH sku_counts AS (
+          SELECT rec_sku, COUNT(*) AS rec_count
+          FROM recommendations r
+          CROSS JOIN LATERAL jsonb_array_elements_text(r.recommended_ids) AS rec_sku
+          GROUP BY rec_sku
+        ),
+        handle_counts AS (
+          SELECT
+            s.handle,
+            s.title,
+            sc.rec_sku AS top_sku,
+            sc.rec_count,
+            ROW_NUMBER() OVER (PARTITION BY s.handle ORDER BY sc.rec_count DESC) AS rn
+          FROM sku_counts sc
+          INNER JOIN sku_to_handle s ON s.sku = sc.rec_sku
+        )
+        SELECT handle, title, top_sku, rec_count
+        FROM handle_counts
+        WHERE rn = 1
+        ORDER BY rec_count DESC
+        LIMIT ${Math.max(needed * 5, 30)}
+      `;
+
+      for (const row of fallbackRows) {
+        if (results.length >= targetCount) break;
+        const handle = row.handle;
+        const sku = row.top_sku;
+        if (!handle || handle === currentHandle || seenHandles.has(handle)) {
+          continue;
+        }
+        seenHandles.add(handle);
+        results.push({
+          sku,
+          handle,
+          title: row.title ?? null,
+          score: 0,
+        });
+      }
+      // If the catalog genuinely doesn't have enough eligible products left,
+      // we fall through with fewer than targetCount — there's nothing left
+      // to backfill with, and the storefront will just show what it got.
+    }
 
     return Response.json(
       {

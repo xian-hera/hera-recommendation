@@ -121,6 +121,7 @@
     const params = new URLSearchParams({
       shop,
       product: productSku,
+      count: String(count),
       ...(customerId && { customer: customerId }),
     });
 
@@ -171,10 +172,14 @@
         return;
       }
 
-      // Fetch all product details in parallel
-      const handles = recs.slice(0, count).map(r => r.handle);
+      // The API returns a few extra candidates beyond `count`, already
+      // ranked and deduplicated by product. Fetch all of them, then keep the
+      // first `count` that are actually available — a product that 404s
+      // (unpublished/hidden/deleted) just gets skipped in favor of the next
+      // ranked candidate, instead of silently shrinking the section.
+      const handles = recs.map(r => r.handle);
       const products = await Promise.all(handles.map(fetchProductDetails));
-      const validProducts = products.filter(Boolean);
+      const validProducts = products.filter(Boolean).slice(0, count);
 
       if (validProducts.length === 0) {
         skeleton.style.display = 'none';
