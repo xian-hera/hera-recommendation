@@ -5,10 +5,8 @@
  * Protected by CRON_SECRET token
  */
 
-import { PrismaClient } from "@prisma/client";
+import prisma from "../db.server.js";
 import { unauthenticated } from "../shopify.server.js";
-
-const prisma = new PrismaClient();
 
 // Convert ET hour to UTC hour (ET = UTC-5 standard, UTC-4 daylight)
 function getEtOffsetHours() {

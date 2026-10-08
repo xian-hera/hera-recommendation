@@ -1,6 +1,6 @@
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
-import { PrismaClient } from "@prisma/client";
+import prisma from "../db.server.js";
 import {
   Page,
   Layout,
@@ -19,7 +19,6 @@ import {
 } from "@shopify/polaris";
 import { useState } from "react";
 
-const prisma = new PrismaClient();
 
 export const loader = async ({ request }) => {
   await authenticate.admin(request);

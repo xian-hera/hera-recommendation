@@ -4,9 +4,8 @@
  * Writes recommended product handles to custom.hera_recommendations
  */
 
-import { PrismaClient } from "@prisma/client";
+import prisma from "../db.server.js";
 
-const prisma = new PrismaClient();
 
 // Write metafield for a single product
 async function setProductMetafield(admin, productId, handles) {

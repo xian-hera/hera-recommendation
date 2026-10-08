@@ -7,10 +7,9 @@
  * Protected by CRON_SECRET token
  */
 
-import { PrismaClient } from "@prisma/client";
+import prisma from "../db.server.js";
 import { unauthenticated } from "../shopify.server.js";
 
-const prisma = new PrismaClient();
 const METAFIELD_BATCH = 25;
 
 function sleep(ms) {

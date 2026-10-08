@@ -11,10 +11,9 @@
  *   to show more than the app-wide default still gets enough candidates.
  */
 
-import { PrismaClient } from "@prisma/client";
+import prisma from "../db.server.js";
 import { unauthenticated } from "../shopify.server.js";
 
-const prisma = new PrismaClient();
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",

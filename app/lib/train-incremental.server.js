@@ -5,12 +5,25 @@
  * using weighted merge (history * historyWeight + new * newDataWeight).
  * After training, queues changed products for metafield sync instead of
  * writing directly (to avoid HTTP timeout).
+ *
+ * 2026-09-28: saveOrders, mergeRecommendations, and queueMetafieldSync below
+ * all used to be plain sequential `for (...) { await prisma... }` loops —
+ * same anti-pattern as sync-sku-handle.server.js's variant loop (see that
+ * file's header and concurrency.server.ts's header for the full incident:
+ * /api/cron/train ran for 10+ minutes with no response and then crashed the
+ * whole web service, Render "Exited with status 134"). Now bounded-
+ * concurrent instead of one-at-a-time. Also switched from this file's own
+ * `new PrismaClient()` to the shared db.server.js singleton — this file,
+ * sync-sku-handle.server.js, and most routes in this app were each creating
+ * their OWN separate PrismaClient (own connection pool + own query engine
+ * process) instead of sharing one, which adds needless memory and Postgres
+ * connection overhead on every request, not just training. See
+ * db.server.js.
  */
 
-import { PrismaClient } from "@prisma/client";
+import prisma from "../db.server.js";
 import { buildRecommendations } from "./apriori.server.js";
-
-const prisma = new PrismaClient();
+import { mapWithConcurrencyLimit, DEFAULT_CONCURRENCY } from "./concurrency.server.js";
 
 // Fetch paid + fulfilled orders from Shopify since a given date
 async function fetchNewOrders(admin, sinceDate) {
@@ -87,7 +100,7 @@ async function fetchNewOrders(admin, sinceDate) {
 // Save new orders to orders table
 async function saveOrders(orders) {
   let saved = 0;
-  for (const order of orders) {
+  await mapWithConcurrencyLimit(orders, DEFAULT_CONCURRENCY, async (order) => {
     await prisma.order.upsert({
       where: { orderId: order.orderId },
       update: { customerId: order.customerId, productIds: order.skus },
@@ -99,7 +112,7 @@ async function saveOrders(orders) {
       },
     });
     saved++;
-  }
+  });
   console.log(`Saved ${saved} orders to database.`);
 }
 
@@ -111,67 +124,71 @@ async function mergeRecommendations(newRecs, historyWeight, newDataWeight) {
   let created = 0;
   const changedSkus = [];
 
-  for (const [productId, newRecList] of newRecs.entries()) {
-    const existing = await prisma.recommendation.findUnique({
-      where: { productId },
-    });
+  await mapWithConcurrencyLimit(
+    [...newRecs.entries()],
+    DEFAULT_CONCURRENCY,
+    async ([productId, newRecList]) => {
+      const existing = await prisma.recommendation.findUnique({
+        where: { productId },
+      });
 
-    if (!existing) {
-      await prisma.recommendation.create({
+      if (!existing) {
+        await prisma.recommendation.create({
+          data: {
+            productId,
+            recommendedIds: newRecList.map((r) => r.id),
+            confidence: newRecList.map((r) => r.confidence * newDataWeight),
+            coOccurrenceCount: newRecList.map((r) => r.coOccurrenceCount),
+          },
+        });
+        created++;
+        changedSkus.push(productId);
+        return;
+      }
+
+      const existingIds = existing.recommendedIds;
+      const existingConfidences = existing.confidence;
+      const existingCounts = existing.coOccurrenceCount;
+
+      const mergedMap = new Map();
+      existingIds.forEach((id, i) => {
+        mergedMap.set(id, {
+          confidence: (existingConfidences[i] || 0) * historyWeight,
+          coOccurrenceCount: existingCounts[i] || 0,
+        });
+      });
+
+      for (const rec of newRecList) {
+        const current = mergedMap.get(rec.id);
+        if (current) {
+          mergedMap.set(rec.id, {
+            confidence: current.confidence + rec.confidence * newDataWeight,
+            coOccurrenceCount: current.coOccurrenceCount + rec.coOccurrenceCount,
+          });
+        } else {
+          mergedMap.set(rec.id, {
+            confidence: rec.confidence * newDataWeight,
+            coOccurrenceCount: rec.coOccurrenceCount,
+          });
+        }
+      }
+
+      const sorted = [...mergedMap.entries()]
+        .sort((a, b) => b[1].confidence - a[1].confidence)
+        .slice(0, 10);
+
+      await prisma.recommendation.update({
+        where: { productId },
         data: {
-          productId,
-          recommendedIds: newRecList.map((r) => r.id),
-          confidence: newRecList.map((r) => r.confidence * newDataWeight),
-          coOccurrenceCount: newRecList.map((r) => r.coOccurrenceCount),
+          recommendedIds: sorted.map(([id]) => id),
+          confidence: sorted.map(([, v]) => v.confidence),
+          coOccurrenceCount: sorted.map(([, v]) => v.coOccurrenceCount),
         },
       });
-      created++;
+      updated++;
       changedSkus.push(productId);
-      continue;
-    }
-
-    const existingIds = existing.recommendedIds;
-    const existingConfidences = existing.confidence;
-    const existingCounts = existing.coOccurrenceCount;
-
-    const mergedMap = new Map();
-    existingIds.forEach((id, i) => {
-      mergedMap.set(id, {
-        confidence: (existingConfidences[i] || 0) * historyWeight,
-        coOccurrenceCount: existingCounts[i] || 0,
-      });
-    });
-
-    for (const rec of newRecList) {
-      const current = mergedMap.get(rec.id);
-      if (current) {
-        mergedMap.set(rec.id, {
-          confidence: current.confidence + rec.confidence * newDataWeight,
-          coOccurrenceCount: current.coOccurrenceCount + rec.coOccurrenceCount,
-        });
-      } else {
-        mergedMap.set(rec.id, {
-          confidence: rec.confidence * newDataWeight,
-          coOccurrenceCount: rec.coOccurrenceCount,
-        });
-      }
-    }
-
-    const sorted = [...mergedMap.entries()]
-      .sort((a, b) => b[1].confidence - a[1].confidence)
-      .slice(0, 10);
-
-    await prisma.recommendation.update({
-      where: { productId },
-      data: {
-        recommendedIds: sorted.map(([id]) => id),
-        confidence: sorted.map(([, v]) => v.confidence),
-        coOccurrenceCount: sorted.map(([, v]) => v.coOccurrenceCount),
-      },
-    });
-    updated++;
-    changedSkus.push(productId);
-  }
+    },
+  );
 
   console.log(`Merge complete: ${created} created, ${updated} updated.`);
   return { created, updated, changedSkus };
@@ -200,15 +217,29 @@ async function queueMetafieldSync(changedSkus) {
   );
 
   let queued = 0;
-  for (const rec of recommendations) {
+  // NOTE: this still does a findFirst+upsert pair per item rather than a
+  // single atomic operation — if two different SKU-level recommendations in
+  // this same batch happen to map to the SAME real Shopify product (via
+  // skuToProductMap), running them concurrently could race on that
+  // find-then-upsert and produce a duplicate row instead of updating one.
+  // That race existed before too (the find and the upsert were never truly
+  // atomic even run one-at-a-time in strict sequence isn't fully immune
+  // either if something else touches the same row between the two calls),
+  // just less likely without concurrency. Kept the concurrency modest
+  // (DEFAULT_CONCURRENCY) rather than unbounded for that reason; a fully
+  // race-proof fix would key the queue on productId directly instead of
+  // find-by-status-then-upsert-by-id — worth doing if this shows up as a
+  // real duplicate-row problem, not done here to keep this fix focused on
+  // the crash.
+  await mapWithConcurrencyLimit(recommendations, DEFAULT_CONCURRENCY, async (rec) => {
     const productId = skuToProductMap[rec.productId];
-    if (!productId) continue;
+    if (!productId) return;
 
     const handles = rec.recommendedIds
       .map((sku) => allSkuToHandle[sku])
       .filter(Boolean);
 
-    if (handles.length === 0) continue;
+    if (handles.length === 0) return;
 
     await prisma.metafieldSyncQueue.upsert({
       where: {
@@ -221,7 +252,7 @@ async function queueMetafieldSync(changedSkus) {
       create: { productId, handles, status: "pending" },
     });
     queued++;
-  }
+  });
 
   console.log(`Queued ${queued} products for metafield sync.`);
   return queued;
