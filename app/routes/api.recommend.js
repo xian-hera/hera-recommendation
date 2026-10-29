@@ -9,10 +9,21 @@
  *   per-request override on top of the admin "Number of recommendations to
  *   show" setting — whichever is larger wins, so a theme section configured
  *   to show more than the app-wide default still gets enough candidates.
+ *
+ * 2026-10-29 performance pass (requests were taking 3.5–8.6 s in Render logs):
+ *   - the site-wide "popular products" fallback and the settings are cached
+ *     in memory (lib/recommend-cache.server.js) instead of re-running a
+ *     full-table aggregate on every call;
+ *   - scoreSkus loads all source SKUs in ONE query instead of one per SKU;
+ *   - the three signals run in parallel, and the Shopify Admin client is
+ *     only created when a signal actually needs Shopify (viewed / customer);
+ * Only SKUs present in sku_to_handle (= ACTIVE products, see
+ * sync-sku-handle.server.js) can ever be returned.
  */
 
 import prisma from "../db.server.js";
 import { unauthenticated } from "../shopify.server.js";
+import { getSettingsCached, getPopularPoolCached } from "../lib/recommend-cache.server.js";
 
 
 const corsHeaders = {
@@ -133,18 +144,24 @@ async function getLastOrderSkus(admin, customerId) {
 // which previously existed in the UI but was never actually read here.
 async function scoreSkus(skus, weight, minConfidence = 0) {
   const scores = new Map();
+  const unique = [...new Set(skus)];
+  if (unique.length === 0) return scores;
+  const rows = await prisma.recommendation.findMany({
+    where: { productId: { in: unique } },
+    select: { productId: true, recommendedIds: true, confidence: true },
+  });
+  const bySku = new Map(rows.map((r) => [r.productId, r]));
+  // Iterate the caller's list (not the unique set) so a SKU passed twice
+  // still counts twice, exactly as before.
   for (const sku of skus) {
-    const rec = await prisma.recommendation.findUnique({
-      where: { productId: sku },
+    const rec = bySku.get(sku);
+    if (!Array.isArray(rec?.recommendedIds)) continue;
+    rec.recommendedIds.forEach((id, i) => {
+      const confidence = rec.confidence[i] || 0;
+      if (confidence < minConfidence) return;
+      const score = confidence * weight;
+      scores.set(id, (scores.get(id) || 0) + score);
     });
-    if (rec?.recommendedIds) {
-      rec.recommendedIds.forEach((id, i) => {
-        const confidence = rec.confidence[i] || 0;
-        if (confidence < minConfidence) return;
-        const score = confidence * weight;
-        scores.set(id, (scores.get(id) || 0) + score);
-      });
-    }
   }
   return scores;
 }
@@ -169,14 +186,16 @@ export const loader = async ({ request }) => {
   }
 
   try {
-    // Get settings
-    const settingsRows = await prisma.setting.findMany();
-    const settings = Object.fromEntries(
-      settingsRows.map((s) => [s.key, s.value])
-    );
+    // Get settings (cached, see lib/recommend-cache.server.js)
+    const settings = await getSettingsCached();
     const recommendCount = Number(settings["recommendation_count"] ?? 4);
     const browseWeight = Number(settings["browse_weight"] ?? 0.4);
     const purchaseWeight = Number(settings["purchase_weight"] ?? 0.6);
+    // NOTE: the admin "Minimum confidence threshold" setting is still NOT
+    // applied here (unchanged behaviour). Stored confidences are weighted
+    // by the history/new-data merge, so turning it on would silently drop
+    // many rules — enable deliberately if wanted.
+    const minConfidence = 0;
 
     // A theme section can be configured to show more items than the app's
     // global "Number of recommendations to show" setting. Respect whichever
@@ -193,38 +212,50 @@ export const loader = async ({ request }) => {
     // unavailable when it fetches the product detail.
     const targetCount = displayCount + RETURN_BUFFER;
 
-    // Get Shopify Admin API client
-    const { admin } = await unauthenticated.admin(shop);
+    const viewedIds = viewedParam
+      ? viewedParam
+          .split(",")
+          .map((id) => id.trim())
+          .filter(Boolean)
+          .slice(0, 5)
+      : [];
 
-    const merged = new Map();
+    // Shopify Admin API client — only needed for the viewed / customer
+    // signals, so plain calls (no signals) skip it entirely.
+    let adminPromise = null;
+    const getAdmin = () => {
+      if (!adminPromise) adminPromise = unauthenticated.admin(shop).then((r) => r.admin);
+      return adminPromise;
+    };
+
+    // The three signals are independent — run them in parallel.
+    const signalJobs = [];
 
     // Signal 1: current product SKU (product page)
     if (productSku) {
-      const scores = await scoreSkus([productSku], browseWeight);
-      for (const [id, score] of scores) {
-        merged.set(id, (merged.get(id) || 0) + score);
-      }
+      signalJobs.push(scoreSkus([productSku], browseWeight, minConfidence));
     }
 
     // Signal 2: recently viewed product IDs from localStorage
-    if (viewedParam) {
-      const viewedIds = viewedParam
-        .split(",")
-        .map((id) => id.trim())
-        .filter(Boolean)
-        .slice(0, 5);
-
-      const viewedSkus = await getSkusFromProductIds(admin, viewedIds);
-      const scores = await scoreSkus(viewedSkus, browseWeight);
-      for (const [id, score] of scores) {
-        merged.set(id, (merged.get(id) || 0) + score);
-      }
+    if (viewedIds.length > 0) {
+      signalJobs.push(
+        getAdmin()
+          .then((admin) => getSkusFromProductIds(admin, viewedIds))
+          .then((viewedSkus) => scoreSkus(viewedSkus, browseWeight, minConfidence))
+      );
     }
 
     // Signal 3: customer last order (2 random SKUs)
     if (customerId) {
-      const lastOrderSkus = await getLastOrderSkus(admin, customerId);
-      const scores = await scoreSkus(lastOrderSkus, purchaseWeight);
+      signalJobs.push(
+        getAdmin()
+          .then((admin) => getLastOrderSkus(admin, customerId))
+          .then((lastOrderSkus) => scoreSkus(lastOrderSkus, purchaseWeight, minConfidence))
+      );
+    }
+
+    const merged = new Map();
+    for (const scores of await Promise.all(signalJobs)) {
       for (const [id, score] of scores) {
         merged.set(id, (merged.get(id) || 0) + score);
       }
@@ -287,53 +318,20 @@ export const loader = async ({ request }) => {
 
     // Fallback: if personalized signals didn't produce enough distinct
     // products, fill the rest from the site-wide "most frequently
-    // recommended" pool (i.e. products that show up most often across all
+    // recommended" pool (products that show up most often across all
     // trained association rules — a proxy for popularity, not a literal
-    // Shopify best-sellers report). Deduplication by product handle happens
-    // inside the SQL query itself (DISTINCT-by-handle via ROW_NUMBER), so
-    // this single query already returns at most one row per product — no
-    // dedupe-then-refetch loop needed here.
+    // Shopify best-sellers report). Already one row per product handle and
+    // active-only; cached in memory (see lib/recommend-cache.server.js).
     if (results.length < targetCount) {
-      const needed = targetCount - results.length;
-
-      const fallbackRows = await prisma.$queryRaw`
-        WITH sku_counts AS (
-          SELECT rec_sku, COUNT(*) AS rec_count
-          FROM recommendations r
-          CROSS JOIN LATERAL jsonb_array_elements_text(r.recommended_ids) AS rec_sku
-          GROUP BY rec_sku
-        ),
-        handle_counts AS (
-          SELECT
-            s.handle,
-            s.title,
-            sc.rec_sku AS top_sku,
-            sc.rec_count,
-            ROW_NUMBER() OVER (PARTITION BY s.handle ORDER BY sc.rec_count DESC) AS rn
-          FROM sku_counts sc
-          INNER JOIN sku_to_handle s ON s.sku = sc.rec_sku
-        )
-        SELECT handle, title, top_sku, rec_count
-        FROM handle_counts
-        WHERE rn = 1
-        ORDER BY rec_count DESC
-        LIMIT ${Math.max(needed * 5, 30)}
-      `;
-
-      for (const row of fallbackRows) {
+      const pool = await getPopularPoolCached();
+      for (const row of pool) {
         if (results.length >= targetCount) break;
-        const handle = row.handle;
-        const sku = row.top_sku;
+        const { handle, sku, title } = row;
         if (!handle || handle === currentHandle || seenHandles.has(handle)) {
           continue;
         }
         seenHandles.add(handle);
-        results.push({
-          sku,
-          handle,
-          title: row.title ?? null,
-          score: 0,
-        });
+        results.push({ sku, handle, title, score: 0 });
       }
       // If the catalog genuinely doesn't have enough eligible products left,
       // we fall through with fewer than targetCount — there's nothing left

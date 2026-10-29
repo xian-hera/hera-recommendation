@@ -3,31 +3,42 @@
  * Called during incremental training to keep mapping up to date
  * Also stores product ID for faster metafield writes
  *
- * 2026-09-28: this used to upsert one variant at a time in a fully
- * sequential loop — at Hera's real catalog size (10,000+ SKUs) that's
- * 10,000+ one-at-a-time DB round trips, run on EVERY training call (cron or
- * manual), before training even looks at a single order. That's the
- * dominant cost behind /api/cron/train hanging for 10+ minutes with zero
- * response and then crashing the whole web service (Render: "Exited with
- * status 134") — see concurrency.server.ts's header for the full story. Now
- * bounded-concurrent instead of one-at-a-time; same upserts, same data,
- * just several in flight at once instead of strictly one.
+ * 2026-10-29: ACTIVE PRODUCTS ONLY. The sku_to_handle table is now the
+ * app's definition of "sellable SKU":
+ *   - only products with status ACTIVE are synced (Draft / Archived are
+ *     skipped), and
+ *   - after a COMPLETE sync, rows that were not refreshed in this run (i.e.
+ *     products that were archived, drafted or deleted since last time) are
+ *     removed.
+ * /api/recommend already only returns SKUs that exist in this table, and
+ * training only learns rules between SKUs in this table, so this one change
+ * makes the whole app active-only.
+ *
+ * Writes are one multi-row INSERT ... ON CONFLICT per Shopify page instead
+ * of one upsert per variant (previously 10,000+ round trips per run — see
+ * the 2026-09-28 incident notes in concurrency.server.js).
  */
 
 import prisma from "../db.server.js";
-import { mapWithConcurrencyLimit, DEFAULT_CONCURRENCY } from "./concurrency.server.js";
+import { upsertSkuMappings } from "./bulk-db.server.js";
 
 export async function syncSkuToHandle(admin) {
-  console.log("Syncing SKU to handle mapping...");
+  console.log("Syncing SKU to handle mapping (active products only)...");
+
+  // DB clock in UTC (Prisma stores DateTime as UTC), kept as text so no
+  // timezone conversion happens between here and the prune below.
+  const [{ now: syncStartedAt }] =
+    await prisma.$queryRaw`SELECT (NOW() AT TIME ZONE 'UTC')::text AS now`;
 
   let cursor = null;
   let hasNextPage = true;
   let synced = 0;
+  let complete = false;
 
   while (hasNextPage) {
     const query = `
       query getProducts($cursor: String) {
-        products(first: 250, after: $cursor) {
+        products(first: 250, after: $cursor, query: "status:active") {
           pageInfo {
             hasNextPage
             endCursor
@@ -37,6 +48,7 @@ export async function syncSkuToHandle(admin) {
               id
               handle
               title
+              status
               variants(first: 100) {
                 edges {
                   node {
@@ -56,35 +68,48 @@ export async function syncSkuToHandle(admin) {
 
     const data = await response.json();
     const products = data.data?.products;
-    if (!products) break;
+    if (!products) {
+      console.error("SKU sync: unexpected response, stopping early:", JSON.stringify(data.errors ?? data).slice(0, 500));
+      break;
+    }
 
-    // Flatten this page's (product, variant) pairs into one list of
-    // upsert jobs, then run them with bounded concurrency instead of one
-    // sequential loop per page — see this file's header note.
-    const variantJobs = [];
+    const rows = [];
     for (const edge of products.edges) {
-      const { id, handle, title, variants } = edge.node;
+      const { id, handle, title, status, variants } = edge.node;
+      if (status !== "ACTIVE") continue; // belt and braces on top of the query filter
       for (const variantEdge of variants.edges) {
         const sku = variantEdge.node.sku?.trim();
         if (!sku) continue;
-        variantJobs.push({ sku, handle, title, productId: id });
+        rows.push({ sku, handle, title, productId: id });
       }
     }
 
-    await mapWithConcurrencyLimit(variantJobs, DEFAULT_CONCURRENCY, async (job) => {
-      await prisma.skuToHandle.upsert({
-        where: { sku: job.sku },
-        update: { handle: job.handle, title: job.title, productId: job.productId },
-        create: job,
-      });
-      synced++;
-    });
+    synced += await upsertSkuMappings(rows);
 
     hasNextPage = products.pageInfo.hasNextPage;
     cursor = products.pageInfo.endCursor;
+    if (!hasNextPage) complete = true;
     console.log(`Synced ${synced} SKU mappings so far...`);
   }
 
-  console.log(`SKU to handle sync complete: ${synced} records.`);
+  // Remove SKUs that are no longer on an active product — but only when the
+  // sync ran to the end and actually found products, so a Shopify hiccup
+  // can't wipe the table.
+  let removed = 0;
+  if (complete && synced > 0) {
+    removed = await prisma.$executeRaw`
+      DELETE FROM sku_to_handle WHERE updated_at < ${syncStartedAt}::timestamp
+    `;
+  } else {
+    console.warn("SKU sync incomplete — skipping removal of non-active SKUs this run.");
+  }
+
+  console.log(`SKU to handle sync complete: ${synced} active SKUs, ${removed} non-active removed.`);
   return synced;
+}
+
+/** Set of SKUs currently considered sellable (= present in sku_to_handle). */
+export async function getActiveSkuSet() {
+  const rows = await prisma.skuToHandle.findMany({ select: { sku: true } });
+  return new Set(rows.map((r) => r.sku));
 }

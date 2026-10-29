@@ -1,6 +1,7 @@
 import { useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server.js";
+import { invalidateRecommendCaches } from "../lib/recommend-cache.server.js";
 import {
   Page,
   Layout,
@@ -58,6 +59,8 @@ export const action = async ({ request }) => {
         create: { key, value },
       });
     }
+    // /api/recommend caches settings for up to a minute — apply now.
+    invalidateRecommendCaches();
     return { success: true, message: "Settings saved." };
   } catch (err) {
     return { success: false, message: err.message };
